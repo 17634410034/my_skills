@@ -203,13 +203,35 @@ def chat(
             try:
                 payload = _post(bound, messages)
                 elapsed = time.time() - started
-                choice = payload["choices"][0]["message"]["content"] or ""
+                choice_msg = payload["choices"][0]["message"]
+                choice = choice_msg.get("content") or ""
+                finish = payload["choices"][0].get("finish_reason") or ""
+                reasoning = choice_msg.get("reasoning_content") or ""
                 usage = payload.get("usage", {})
+                rtokens = (
+                    usage.get("completion_tokens_details", {}) or {}
+                ).get("reasoning_tokens", len(reasoning) // 2)
+                # 推理型模型会把 max_tokens 全花在思维链上，content 返回空串、
+                # finish_reason=length。上层若直接落盘，产物是 0-2 字节的「空文件」，
+                # 看起来像通道挂了，其实是配额问题——这里必须报出来，不能静默返回。
+                if not choice.strip():
+                    last_err = LLMError(
+                        f"{bound['provider']}/{bound['model']} 返回空正文"
+                        f"（finish_reason={finish or '?'}, reasoning_tokens={rtokens}, "
+                        f"max_tokens={bound['max_tokens']}）。"
+                        f"最可能是推理链吃满输出配额：提高该角色 max_tokens（建议 20000+），"
+                        f"或在 prompt 末尾追加输出体量硬约束（条数上限 / 字数上限 / 禁止复述原文）。"
+                    )
+                    emit(f"  [{role}] {last_err}")
+                    if attempt < retries:
+                        time.sleep(1.5 * (attempt + 1))
+                    continue
                 if not silent:
                     log(
                         f"  [{role}] {bound['provider']}/{bound['model']} "
                         f"{elapsed:.1f}s in={usage.get('prompt_tokens', '?')} "
                         f"out={usage.get('completion_tokens', '?')}"
+                        f"（其中 reasoning={rtokens}）"
                     )
                 return {
                     "text": choice,
@@ -338,9 +360,19 @@ def collect_context(
         total += len(block)
 
     if repo:
+        # 文件树原本无体积保护：整仓树可轻松吃掉整个 max_chars 预算，
+        # 把真正要审的文档与源码挤出去（实测会让调用既慢又无效）。
         tree = file_tree(repo)
-        header = f"===== PROJECT TREE: {repo} =====\n{tree}\n"
-        chunks.insert(0, header)
+        budget = max_chars - total
+        tree_cap = max(3000, int(budget * 0.30))
+        note = ""
+        if budget <= 0:
+            tree, note = "", "\n!! 上下文预算已被文件占满，本次未附项目文件树\n"
+        elif len(tree) > tree_cap:
+            tree = tree[:tree_cap]
+            note = f"\n... （文件树已截断到 {tree_cap} 字符，仅用于定位，不可当作证据）\n"
+        if tree:
+            chunks.insert(0, f"===== PROJECT TREE: {repo} =====\n{tree}\n{note}")
 
     if truncated:
         chunks.append(

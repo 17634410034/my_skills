@@ -20,9 +20,20 @@ estimated_effort: 2-3 人时
 # ── 评审强度（必填，接手方靠它判断这份文档该信几分）──
 review_mode: full              # full=跨族双模型 | session=同族多会话 | single=单会话审两遍
 reviewers: ["glm-5.3", "deepseek-v4-pro"]
+authored_by: host              # host=主持撰写（需 degraded.md 记 AUTHORED-BY-HOST 与原因）| agent1=模型起草
+fixed_by: host                 # host=主持修复（FIXED-BY-HOST）| agent1
 merge_by: agent4               # agent4=独立会话归并 | host=主持兼任（漏并风险高）
-assumptions_verified: 3/4      # §0.1 里有几条被审稿人真的到仓库核实过
+sign_rounds: 2                 # sign 实际跑了几轮；≥3 轮未过必须交用户裁决
+coldread_rounds: 2             # 冷读跑了几轮（方案缺陷回流后要重跑）
+assumptions_verified: 3/4      # §0.1 里有几条被真的到仓库核实过
+verified_by: host              # host=主持核实（API 审稿人无文件读权限时填这个）| reviewers
 known_blindspot: ""            # 降级时写清丢了什么，如"同族，共模盲区未消除"
+
+# ── 交付落点与产物处置（交付前与用户确认，别默认扔仓库根）──
+deliverable_path: /abs/path/<需求名>-开发文档.md   # 按该项目既有文档目录规则推导；确认不了才兜底落工作区根
+artifacts: cleaned             # cleaned=只留本文档 | kept=.hdr-gate/ 全套保留 | partial=留 recon+双审清单
+records_dir: .tmp_trace/<需求名>/   # 执行期记录（t0-findings / pytest-baseline / t8-findings）落这里，必须 gitignored
+artifacts_note: "过程产物已清理，§10「依据」列的文件名仅作溯源线索，不再可打开"
 ---
 ```
 
@@ -64,6 +75,11 @@ known_blindspot: ""            # 降级时写清丢了什么，如"同族，共�
 | 分支 | `feature/xxx`（基于 `main@a1b2c3d`） |
 | 运行时版本 | Node 22.x / Python 3.13.x |
 | 包管理器 | pnpm 9 / uv |
+| 工作区状态 | 交付前跑 `git status --short` 并记录：**若有未提交的并行改动线动了本文引用的文件，必须在下方写「基线告警」**，要求执行者以自己检出的 tree 为准做 T0 核对（行号会漂移） |
+| [ENV] 前置 | 哪些卡需要起服务 / LLM 凭据 / 内网 DB；给不出这些环境时的处置见 §6.2 |
+| 过程记录落点 | 执行期要写的核对/标定记录统一写 `$REC`（本文档 frontmatter `records_dir`，必须是 gitignored 目录）。正文定义一次：`REC=<路径> && mkdir -p $REC`，后文一律用 `$REC/xxx.md` 引用，**不要把记录写进文档所在目录** |
+
+**基线告警（无则写「无」）**：……
 
 ### 1.2 动手前必须跑通
 ```bash
@@ -159,6 +175,13 @@ ALTER TABLE users ADD COLUMN failed_attempts INT NOT NULL DEFAULT 0;
 
 > 规则：每张卡必须**可独立完成、可独立验证**。卡与卡之间只通过「已完成状态」耦合。
 > 禁止在一张卡里塞多个目标。
+>
+> **四条硬约束（冷读实测出来的，违反任何一条都会被陌生执行者打回）**
+>
+> 1. **要照抄的，就得内嵌**：凡是「逐字搬移 / 复制这段实现 / 照抄范式」，被复制对象必须以完整代码块写在卡的「需要的上下文」里。只给 `文件:行号` = 没写。
+> 2. **命令必须可原样执行**：不出现未定义的 shell 变量（要先给 `make_key() { … }` 这类定义段）、不写机器绝对路径的解释器（统一 `uv run python` / `pnpm`）、管道里的断言能给出期望输出。
+> 3. **依赖真环境的卡标 `[ENV]`**：起服务、LLM 凭据、内网 DB 都算。并在 §6.2 写清「环境不具备时停在卡前并如实报告，禁止伪造输出」。
+> 4. **卡里不许出现 `...` 省略号式的待补签名**：类/函数构造参数、字段清单、枚举值要么写全，要么明确「由 T0 实测回填」并给出实测命令。
 
 ### T1 · <动词开头的任务名>
 - **目标**：……
@@ -201,6 +224,7 @@ ALTER TABLE users ADD COLUMN failed_attempts INT NOT NULL DEFAULT 0;
 | `src/core/scheduler.py` | 生产定时任务，改动影响面不可控 |
 | `config/prod.yaml` | 生产配置，需走运维流程 |
 | 任何 `.env*` | 含密钥，不得提交 |
+| `.hdr-gate/**`、本文 `<需求名>.md` | 流程产物，**不得 `git add -A` 带进提交**（多数仓库的 `.gitignore` 并不忽略它们，交付时实测确认） |
 
 ### 6.2 必须停下来询问的条件 <!-- 必填 -->
 遇到以下任一情况，**停止执行并报告，不要自行决策**：
@@ -260,8 +284,23 @@ ALTER TABLE users ADD COLUMN failed_attempts INT NOT NULL DEFAULT 0;
 
 ---
 
-## 附录 A · 交接时可直接粘贴给接手 agent 的开场语
+## 11. 交付确认（落点 / 产物处置 / 引用清理）
 
+<!-- 必填：首次在本项目使用门禁时，这两问不能跳过 -->
+
+| # | 确认项 | 默认值怎么来的 | 用户选择 |
+|---|---|---|---|
+| 1 | 最终文档落在哪个目录、叫什么名 | 先 `ls` 本项目既有开发文档，归纳真实规则（日期前缀 / 编号前缀 / 目录名 / 是否带「-开发文档」后缀），按规则推出完整路径作推荐项 | ______ |
+| 2 | 中间产物（`.hdr-gate/<需求名>/`）要不要清理 | 推荐「只留最终文档」，但**清理是不可逆动作，必须用户点头** | ______ |
+
+**选了「清理」后的强制动作**（顺序错了就会把交付物删掉）：
+
+1. 移动文档到确认路径 → `ls -la` + `wc -c` 验证字节数与内容完整 → **才** `rm -rf .hdr-gate/<需求名>`。
+2. 逐条改掉文档里指向已删产物的引用：frontmatter `known_blindspot`、§10「依据」列（保留文件名作溯源线索 + 补一句「已清理，不可打开，需复核请重跑门禁」）、以及所有指向 `.hdr-gate/` 的**执行期记录路径**——这些改成 `records_dir`（gitignored 临时目录），因为接手方还要往那里写 `t0-findings.md` / `pytest-baseline.txt`。
+3. 自检：`grep -n "hdr-gate" <最终文档>` 必须为空；`grep -c "^### T"`、`^## 附录` 的数量与清理前一致（批量替换容易吞标题）。
+4. 交付说明里写清：最终路径、命名依据、清理了什么、改写了哪些引用。
+
+## 附录 A · 交接时可直接粘贴给接手 agent 的开场语
 > 你将执行一项开发任务。任务规格文档：`<文档路径>`。
 > 请先完整读完该文档，然后：
 > 1. 用 5 行以内复述你理解的目标与改动范围，我不打断你；

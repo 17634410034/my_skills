@@ -10,3 +10,6 @@ hdr-gate/tools/config.toml
 
 # 门禁过程产物
 .hdr-gate/
+
+# 项目落点登记簿（运行时状态，不发布）
+hdr-gate/tools/.hdr-projects.json

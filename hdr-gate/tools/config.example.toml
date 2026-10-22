@@ -49,6 +49,7 @@ timeout = 600
 # family：模型族，决定异质性判定。可省略，省略时按 model 名自动推断
 # fallback：主通道 401/404/超时 时自动切过去
 
+# ⚠️ 推理型模型会把 max_tokens 花在思维链上：配低了不会报错，而是返回空正文（content=""、finish_reason=length），产物落成 0-2 字节空文件。审稿人/冷读者建议 20000。
 [roles.agent1]                 # 作者：分析、写文档、修复、补齐
 provider = "tokenplan"
 model = "qwen3.8-max"
@@ -60,33 +61,34 @@ max_tokens = 32000
 provider = "dashscope"
 model = "qwen3-max"
 
+# 可行性审稿人：输出是清单，20000 给推理链留余量
 [roles.agent2]                 # 可行性审稿人：能不能照着落地 + 信息完备性
 provider = "tokenplan"
 model = "glm-5.3"
 family = "zhipu"
 temperature = 0.2
-max_tokens = 16000
+max_tokens = 20000
 
 [roles.agent3]                 # 正确性审稿人：做出来会不会错
 provider = "tokenplan"
 model = "deepseek-v4-pro"      # 想要便宜可换 deepseek-v4.1-flash
 family = "deepseek"
 temperature = 0.2
-max_tokens = 16000
+max_tokens = 20000
 
 [roles.agent4]                 # 合并去重：只做机械归并，不定级
 provider = "tokenplan"
 model = "qwen3.8-flash"
 family = "qwen"
 temperature = 0.0
-max_tokens = 16000
+max_tokens = 20000
 
 [roles.coldread]               # 冷读试跑者：必须异质于 agent1，且未参与评审
 provider = "tokenplan"
 model = "glm-5.2"              # 换成别的族更佳；同族时用小尺寸（字面化，不脑补）
 family = "zhipu"
 temperature = 0.1
-max_tokens = 16000
+max_tokens = 20000
 
 # ---------- 夜间接力（可选） ----------
 # Token Plan 的 qwen3.8 / deepseek 系列有夜间折扣（4–5 折）。

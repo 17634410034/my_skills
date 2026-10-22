@@ -92,6 +92,22 @@ python3 hdr.py status    --name X                          # 看进度和花费
 python3 hdr.py run       --name X --auto                   # 一条龙
 ```
 
+### finalize 之后：落点确认与产物清理（默认路径只是兜底）
+
+不带 `--out` 时 `<需求名>.md` 落在**当前目录**——在有文档规范的项目里通常是错的。收尾三步：
+
+```bash
+# 1) 先问用户：最终文档放哪（照该项目既有规则）+ 中间产物要不要清理
+ls <repo>/app/service/*/openspec/specs 2>/dev/null | tail -5     # 归纳规则：日期前缀？-开发文档 后缀？
+# 2) 先移动 + 校验字节数，通过后才删过程产物（顺序反了就是把交付物删了）
+mv <需求名>.md <确认目录>/<确认文件名>.md && wc -c <确认目录>/<确认文件名>.md
+# 3) 清理后必须改文档自引用，否则接手方打不开 degraded.md / resolution.md
+grep -n "hdr-gate" <确认目录>/<确认文件名>.md     # 期望：空
+rm -rf .hdr-gate/<需求名>
+```
+
+执行期记录（`t0-findings.md` / `pytest-baseline.txt` / `t8-findings.md`）**不要**写在 `.hdr-gate/`（会跟着一起删），也不要写进文档所在目录（污染 git）——写到仓库已 gitignore 的临时目录，文档里定义一次 `REC=<临时目录> && mkdir -p $REC` 之后统一引用。
+
 阶段 5（分歧裁定）刻意没有自动化——那是判断题，要人来做。脚本会把分歧候选放在 `merged.md` 的第三节，你裁决后写进 `resolution.md`，`sign` 阶段会自动带上。
 
 ---
@@ -185,7 +201,7 @@ model = "glm-5.3"
 
 ---
 
-## 三个容易踩的坑
+## 五个容易踩的坑
 
 **1. 模型 id 一定要核对，别照抄示例**
 跑 `python3 hdr.py models --provider tokenplan` 看返回的真实 id。名字打错会 404，然后 `fallback` 悄悄顶上——日志里能看出来，但很容易漏。
@@ -195,6 +211,40 @@ model = "glm-5.3"
 
 **3. `finalize` 可能拒绝执行**
 如果补齐过程中发现必须改方案，它会输出 `!! SCHEME-DEFECT` 并以退出码 3 结束。这是设计好的：改方案必须回 `fix` 重走双签，不能在「补齐」的名义下偷偷改。
+
+**4. 产物 0–2 字节的空文件 ≠ 模型不可用**
+推理型模型（`glm-5.x` / `deepseek-v4-pro` / `qwen3.x` 思考档）会把 `max_tokens` 花在思维链上，正文 `content` 返回空串、`finish_reason=length`。`llm.py` 只取 `content`，早期版本会把空产物直接落盘、让下一阶段拿垃圾当输入。现在：空正文会报错并在 `progress.log` 打出 `out= / reasoning=`，各阶段落盘前还会校验非空 + 期望标记。
+**处置**：把该角色 `max_tokens` 提到 20000（config 已默认），并在 prompt 末尾追加输出体量硬约束（条数上限 / 字数上限 / 禁止复述原文）。
+
+**5. `draft` / `fix` / `finalize` 用 API 起草整份长文档，几乎必超时**
+非流式调用的墙钟时间由**输出长度**决定：一次生成 1–3 万 token 的完整文档，压上下文、降 `max_tokens`、抬 `timeout` 都救不了（实测 22K 字符上下文 + 14000 上限 + 900s，仍在 1000s 后无响应）。
+**正路**：`draft` 检测到 `v0.1.md` 已存在时**只做硬门禁自检后放行**（不通过直接退出），所以由主持自己写 v0.1/v0.2/定稿是被工具承认的一等路径——前提是在 `degraded.md` 标 `AUTHORED-BY-HOST` / `FIXED-BY-HOST` 并在交付时声明。API 只跑 review / merge / sign / coldread（它们输出短，实测 77–345s 全部返回）。
+
+## 运行位置与状态
+
+- `.hdr-gate/` 落在**执行命令时的 cwd**，`<需求名>.md` 交付物同理。请固定在**目标仓库根目录**执行所有命令。`init` 会把绝对路径登记到 `tools/.hdr-projects.json`，换目录执行时后续命令能自动找回现场（会打印一行提示）。
+- agent 宿主（Qoder/Claude 类）的 shell 是**非交互式且状态不跨调用**：`TOKENPLAN_API_KEY` 每条命令都要重新注入，`cd` 也要每条带上。
+- 慢阶段等待配方（单条 Bash 调用常封顶 10 分钟）：
+  ```bash
+  D=".hdr-gate/<需求名>"
+  for i in $(seq 1 34); do
+    [ -s "$D/review-a.md" ] && [ -s "$D/review-b.md" ] && break
+    pgrep -f "hdr.py review" >/dev/null || { echo "PROCESS GONE"; break; }
+    sleep 15
+  done
+  tail -5 "$D/progress.log"
+  ```
+  超过一轮就**在同一回合内再开一轮**，别结束回合（后台完成通知只在下一回合到达，没人收就等于任务死在半路）。
+
+## 阶段产物与门禁
+
+| 阶段 | 产物 | 落盘前校验 |
+|---|---|---|
+| draft | `v0.1.md` | 任务卡 / 验收断言 / 非目标 三项必含，缺则退出（API 起草与主持自写都跑这套） |
+| review | `review-a.md` `review-b.md` | ≥120 字符且含 `[P0-/P1-/P2-` |
+| merge | `merged.md` | 含「溯源 / 归入」 |
+| sign | `sign.md` `sign-roundN.md` `v0.3.md` `v0.3.roundN.md` | 两位都必须含 `SIGNOFF`；`meta.json.sign_round` 累计，第 3 轮不过会提示交用户裁决 |
+| coldread | `coldread.md` | ≥120 字符且含 `GAP-n`；**默认纯净模式**（不附带任何上下文与 recon.md），要带才加 `--with-context` |
 
 ---
 

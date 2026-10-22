@@ -34,7 +34,27 @@ import prompts
 HERE = Path(__file__).resolve().parent
 TEMPLATE = HERE.parent / "dev-doc-template.md"
 WORKROOT = Path(".hdr-gate")
+# 项目根登记簿：`.hdr-gate` 原本相对 cwd，而 cwd 每回合都可能不同
+# （实测：在 tools/ 目录里 init，产物落进了 skill 目录，之后在仓库里找不到项目）。
+# init 时记下绝对路径，后续命令即使换了目录也能找回现场。
+REGISTRY = HERE / ".hdr-projects.json"
 HEARTBEAT_SEC = 20
+
+
+def _registry_read() -> dict:
+    try:
+        return json.loads(REGISTRY.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _registry_record(name: str, directory: Path) -> None:
+    data = _registry_read()
+    data[name] = str(Path(directory).resolve())
+    try:
+        REGISTRY.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # 登记簿只是找回现场的线索，写失败不该中断流程
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +150,16 @@ def call_roles_parallel(proj: "Project", step: str, cfg: dict, jobs: list[dict])
 class Project:
     def __init__(self, name: str, root: Path | None = None):
         self.name = name
-        self.dir = (root or WORKROOT) / name
+        local = (root or WORKROOT) / name
+        recorded = _registry_read().get(name)
+        if (local / "meta.json").exists():
+            self.dir = local
+        elif recorded and (Path(recorded) / "meta.json").exists():
+            self.dir = Path(recorded)
+            print(f"（项目不在当前目录，已从登记簿找回：{self.dir}）")
+        else:
+            self.dir = local
+        self.meta_path = self.dir / "meta.json"
         self.meta_path = self.dir / "meta.json"
 
     @property
@@ -209,6 +238,39 @@ def count_gaps(text: str) -> int:
     return len(re.findall(r"\[GAP-\d+\]", text))
 
 
+# 每个阶段的产物都必须「像被认真写过」。空产物几乎都源于推理模型把
+# max_tokens 花在思维链上（content 空），落盘后会得到 0-2 字节的文件，
+# 让后续阶段拿垃圾当输入。宁可在这里炸掉，也不要往下传。
+ARTIFACT_RULES = {
+    "review-a.md": (120, r"\[P[012]-"),
+    "review-b.md": (120, r"\[P[012]-"),
+    "merged.md": (120, r"溯源|归入"),
+    "coldread.md": (120, r"GAP-\d+|复述"),
+    "v0.2.md": (2000, None),
+    "v0.3.md": (2000, None),
+}
+
+
+def require_artifact(proj: "Project", filename: str, text: str, *, step: str) -> str:
+    min_chars, pattern = ARTIFACT_RULES.get(filename, (120, None))
+    body = (text or "").strip()
+    if len(body) < min_chars:
+        raise SystemExit(
+            f"!! {step} 阶段产物不合格：{filename} 只有 {len(body)} 字符（要求 ≥{min_chars}）。\n"
+            f"   先看 {proj.path('progress.log')} 里的 out= / reasoning= 数值：\n"
+            f"   - out 撞 max_tokens 上限 → 推理链吃满配额，提高该角色 max_tokens 或给 prompt 加输出体量硬约束\n"
+            f"   - out 很小且没有正文 → 该模型真的没答，换尺寸/换族\n"
+            f"   未落盘，现场已保留。"
+        )
+    if pattern and not re.search(pattern, body):
+        raise SystemExit(
+            f"!! {step} 阶段产物不合格：{filename} 缺少期望标记 /{pattern}/。\n"
+            f"   产物已写到 {proj.path(filename)}，但格式漂移会让下一阶段静默降级——"
+            f"请检查 prompt 是否被模型改写，或重跑该阶段。"
+        )
+    return body
+
+
 def load_ctx(meta: dict, extra: list[str] | None = None) -> str:
     repo = meta.get("repo")
     paths = list(meta.get("context", [])) + (extra or [])
@@ -249,7 +311,12 @@ def cmd_init(args) -> None:
             "history": [],
         }
     )
-    print(f"已创建: {proj.dir}")
+    _registry_record(proj.name, proj.dir)
+    print(f"已创建: {proj.dir.resolve()}")
+    print(
+        f"  ⚠️ 产物落点 = 命令执行时的当前目录。后续每条命令都要在**同一目录**"
+        f"（推荐目标仓库根目录）执行；换目录时会自动从登记簿找回，但密钥与 cd 状态不跨 shell 保留。"
+    )
     if getattr(args, "assume", None):
         lines = ["# 假设账本", "", "> 未确认的前提逐条编号。每条必须有依据；阶段 2 的 Agent2 会逐条到仓库里打假。", ""]
         for raw in args.assume:
@@ -267,7 +334,23 @@ def cmd_draft(args) -> None:
     proj = Project(args.name)
     meta = proj.meta()
     if proj.path("v0.1.md").exists() and not getattr(args, "force", False):
-        print(f"v0.1.md 已存在（{proj.path('v0.1.md')}），跳过起草。重跑请加 --force")
+        # v0.1 可能由主持自行撰写（单次 API 生成整份长文档常超读超时，这是合法路径），
+        # 但硬门禁一样要跑：缺任务卡/验收断言就不许进评审。
+        doc = proj.read("v0.1.md")
+        checks = {
+            "任务卡(T1…)": bool(re.search(r"###\s*T1\b|##\s*5\.\s*任务卡", doc)),
+            "验收断言(命令)": "```" in doc,
+            "非目标清单": "非目标" in doc,
+        }
+        print(f"v0.1.md 已存在（{proj.path('v0.1.md')}），跳过 API 起草。")
+        print(f"  长度 {len(doc)} 字符；门禁自检：")
+        for k, ok in checks.items():
+            print(f"  {'✅' if ok else '⛔'} {k}")
+        if not all(checks.values()):
+            raise SystemExit("  !! 已有 v0.1.md 未通过门禁（缺章节），补齐后再 review；不得带残缺进评审。")
+        meta.setdefault("authored_by", "host")
+        meta["stage"] = "draft"
+        proj.save_meta(meta)
         print(f"下一步: python3 hdr.py review --name {args.name}")
         return
     cfg = cfg_of(meta)
@@ -285,6 +368,16 @@ def cmd_draft(args) -> None:
             f"  ⚠️  上下文 {len(ctx)} 字符偏大：单次调用可能 10 分钟以上。\n"
             f"     建议先压到 6 万以内（--context 只给关键文件，或 --max-context-chars 60000），\n"
             f"     细节缺口本来就该由双审和冷读逼出来，不必一次吞完。"
+        )
+    agent1_cap = int(cfg.get("roles", {}).get("agent1", {}).get("max_tokens", 8192) or 0)
+    if agent1_cap >= 12000:
+        print(
+            f"  ⚠️  agent1.max_tokens={agent1_cap}：单次非流式生成整份长文档"
+            f"（再叠加推理链）在这类通道上极易超过 provider timeout 而空手而归，"
+            f"且**瓶颈是输出长度，不是上下文体积**。\n"
+            f"     省时做法：由主持自己写 v0.1.md（SKILL 第 1 步明文允许），"
+            f"本命令检测到已有文件会做门禁自检后放行；"
+            f"坚持 API 起草就把它拆成「先骨架后逐节」多次调用。"
         )
     result = call_role(proj, "draft", cfg, "agent1", prompts.draft_messages(meta["requirement"], ctx, template))
     proj.write("v0.1.md", extract_doc(result["text"]))
@@ -319,6 +412,8 @@ def cmd_review(args) -> None:
         {"role": "agent3", "messages": prompts.review_correctness_messages(doc, ctx)},
     ]
     res = call_roles_parallel(proj, "review", cfg, jobs)
+    for idx, fname in enumerate(("review-a.md", "review-b.md")):
+        require_artifact(proj, fname, res[idx]["text"], step="review")
     proj.write("review-a.md", res[0]["text"])
     proj.write("review-b.md", res[1]["text"])
     for r in res:
@@ -341,6 +436,7 @@ def cmd_merge(args) -> None:
 
     print("[3/8] Agent4(flash) 机械归并…")
     result = call_role(proj, "merge", cfg, "agent4", prompts.merge_messages(a, b))
+    require_artifact(proj, "merged.md", result["text"], step="merge")
     proj.write("merged.md", result["text"])
     proj.add_cost(meta, result, "merge")
     meta["stage"] = "merge"
@@ -393,6 +489,16 @@ def cmd_sign(args) -> None:
         },
     ]
     res = call_roles_parallel(proj, "sign", cfg, jobs)
+    for idx, who in enumerate(("Agent2", "Agent3")):
+        body = (res[idx]["text"] or "").strip()
+        if len(body) < 80 or "SIGNOFF" not in body:
+            raise SystemExit(
+                f"!! {who} 的签署意见不合格（{len(body)} 字符 / 无 SIGNOFF 标记），"
+                f"无法判定双签。现场：{proj.path('progress.log')}\n"
+                f"   若是空正文：提高该角色 max_tokens 后重跑 sign。"
+            )
+    round_no = int(meta.get("sign_round", 0)) + 1
+    meta["sign_round"] = round_no
     ok_a, why_a = parse_signoff(res[0]["text"])
     ok_b, why_b = parse_signoff(res[1]["text"])
 
@@ -411,20 +517,29 @@ def cmd_sign(args) -> None:
         res[1]["text"],
     ]
     proj.write("sign.md", "\n".join(report))
+    proj.write(f"sign-round{round_no}.md", "\n".join(report))
     for r in res:
         proj.add_cost(meta, r, "sign")
 
     if ok_a and ok_b:
         proj.write("v0.3.md", doc)
+        proj.write(f"v0.3.round{round_no}.md", doc)
         meta["stage"] = "signoff"
         proj.save_meta(meta)
-        print(f"  ✅ 双签通过 → v0.3.md")
+        print(f"  ✅ 双签通过（第 {round_no} 轮）→ v0.3.md（本轮存档 v0.3.round{round_no}.md）")
         print(f"下一步: python3 hdr.py coldread --name {args.name}")
     else:
         meta["stage"] = "signoff-failed"
         proj.save_meta(meta)
-        print(f"  ❌ 双签未通过：{why_a or why_b}")
-        print(f"  详见 {proj.path('sign.md')}；修复后重跑 fix → sign（返工上限 2 轮）")
+        print(f"  ❌ 双签未通过（第 {round_no} 轮）：{why_a or why_b}")
+        if round_no >= 3:
+            print(
+                "  ⛔ 已达返工上限（2 轮修复 + 第 3 轮仍不通过）。按 SOP 第 6 步，"
+                "**停止自行返工，把分歧交给用户裁决**，"
+                "裁决写入 resolution.md 后再重跑 sign。"
+            )
+        else:
+            print(f"  详见 {proj.path('sign.md')}；修复后重跑 fix → sign（返工上限 2 轮）")
         sys.exit(2)
 
 
@@ -436,12 +551,22 @@ def cmd_coldread(args) -> None:
     ctx = load_ctx(meta)
 
     role = "coldread"
-    if meta.get("repo") is None and args.context:
-        ctx = llm.collect_context(args.context, repo=None, max_chars=meta.get("max_context_chars", 120_000))
+    if getattr(args, "with_context", False):
+        ctx = load_ctx(meta, args.context)
+    else:
+        # 冷读的价值全靠「陌生」。默认把作者写的事实底稿/源码一起喂进去，
+        # 等于让冷读者带着作者的先验补课，缺口清单会假性变干净。
+        ctx = (
+            "（按冷读设计，本次不提供任何项目上下文与作者的事实底稿。"
+            "凡是动手必须知道、而文档没给的信息——路径、签名、字段、命令、"
+            "import 写法、行号——一律写进缺口清单，不得靠常识补全。）"
+        )
+        print("  冷读纯净模式：不附带上下文（需要时用 --with-context 显式打开）")
 
     print("[7/8] 冷读试跑：陌生视角，只给文档 + 代码，不许提问…")
     print(f"  模型: {cfg['roles'][role]['provider']}/{cfg['roles'][role]['model']}")
     result = call_role(proj, "coldread", cfg, role, prompts.coldread_messages(doc, ctx, meta.get("repo")))
+    require_artifact(proj, "coldread.md", result["text"], step="coldread")
     proj.write("coldread.md", result["text"])
     proj.add_cost(meta, result, "coldread")
     meta["stage"] = "coldread"
@@ -705,6 +830,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name", required=True)
     sp.add_argument("--doc", default="v0.3.md")
     sp.add_argument("--context", nargs="*")
+    sp.add_argument(
+        "--with-context",
+        action="store_true",
+        help="把项目上下文/作者事实底稿一起喂给冷读者（削弱陌生度，默认关闭）",
+    )
 
     sp = add("finalize", cmd_finalize, "阶段8：补齐定稿")
     sp.add_argument("--name", required=True)
