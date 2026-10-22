@@ -1,0 +1,118 @@
+# ============================================================
+# HDR Gate 模型配置
+# 用法：cp config.example.toml config.toml 然后填密钥
+# 密钥支持 ${ENV_VAR}，从环境变量读，配置文件里不要写明文
+# 需要 Python 3.11+（内置 tomllib）
+#
+# 一个关键概念：provider 是「通道」，family 是「模型族」。
+# 异质性看 family，不看 provider —— 阿里百炼 Token Plan 一个通道里
+# 同时有 Qwen / GLM / DeepSeek 三家模型，通道相同但模型族不同，
+# 盲区照样不重合，双审依然有效。
+# ============================================================
+
+default_provider = "tokenplan"
+
+# ---------- 接入通道：全部走 OpenAI 兼容 /chat/completions ----------
+
+# 阿里云百炼 Token Plan 个人版（首选：一个 key 拿到三家模型）
+# 控制台签发的专属 API Key；也支持 Anthropic 协议
+# （/apps/anthropic，本工具未使用，仅 OpenAI 协议）
+[providers.tokenplan]
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+api_key = "${TOKENPLAN_API_KEY}"
+timeout = 600
+
+# 自建/内网 OpenAI 兼容网关（如 one-api / new-api / LiteLLM）
+# 把 127.0.0.1 换成你自己的地址
+[providers.newapi]
+base_url = "http://127.0.0.1:9021/v1"
+api_key = "${NEWAPI_KEY}"
+timeout = 600
+
+[providers.dashscope]          # 阿里云百炼标准版（非 Token Plan）
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "${DASHSCOPE_API_KEY}"
+timeout = 600
+
+[providers.zhipu]              # 智谱官方
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key = "${ZHIPU_API_KEY}"
+timeout = 600
+
+[providers.deepseek]           # DeepSeek 官方
+base_url = "https://api.deepseek.com/v1"
+api_key = "${DEEPSEEK_API_KEY}"
+timeout = 600
+
+# ---------- 角色绑定 ----------
+# model：填通道里的真实模型 id（用 `python3 hdr.py models` 可以列出来）
+# family：模型族，决定异质性判定。可省略，省略时按 model 名自动推断
+# fallback：主通道 401/404/超时 时自动切过去
+
+[roles.agent1]                 # 作者：分析、写文档、修复、补齐
+provider = "tokenplan"
+model = "qwen3.8-max"
+family = "qwen"
+temperature = 0.3
+max_tokens = 32000
+
+[roles.agent1.fallback]
+provider = "dashscope"
+model = "qwen3-max"
+
+[roles.agent2]                 # 可行性审稿人：能不能照着落地 + 信息完备性
+provider = "tokenplan"
+model = "glm-5.3"
+family = "zhipu"
+temperature = 0.2
+max_tokens = 16000
+
+[roles.agent3]                 # 正确性审稿人：做出来会不会错
+provider = "tokenplan"
+model = "deepseek-v4-pro"      # 想要便宜可换 deepseek-v4.1-flash
+family = "deepseek"
+temperature = 0.2
+max_tokens = 16000
+
+[roles.agent4]                 # 合并去重：只做机械归并，不定级
+provider = "tokenplan"
+model = "qwen3.8-flash"
+family = "qwen"
+temperature = 0.0
+max_tokens = 16000
+
+[roles.coldread]               # 冷读试跑者：必须异质于 agent1，且未参与评审
+provider = "tokenplan"
+model = "glm-5.2"              # 换成别的族更佳；同族时用小尺寸（字面化，不脑补）
+family = "zhipu"
+temperature = 0.1
+max_tokens = 16000
+
+# ---------- 夜间接力（可选） ----------
+# Token Plan 的 qwen3.8 / deepseek 系列有夜间折扣（4–5 折）。
+# 若你只在夜间跑批，可把 provider 换成下面这个别名，白天再换回来。
+# [providers.tokenplan_night]
+# base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+# api_key = "${TOKENPLAN_API_KEY}"
+# timeout = 600
+
+# ---------- 模型族对照（供参考，无需修改） ----------
+# qwen*          → qwen
+# glm*           → zhipu
+# deepseek*      → deepseek
+# claude*        → anthropic
+# gpt* / o1*     → openai
+# kimi*          → moonshot
+# decision-model*→ domain
+
+# ---------- 成本估算 ----------
+[pricing]
+# 单位：元 / 百万 token（按官方价填，Token Plan 折扣自行折算）
+"qwen3.8-max" = 4.0
+"qwen3.8-flash" = 0.5
+"qwen3.7-plus" = 2.0
+"qwen3.7-max" = 6.0
+"glm-5.3" = 3.0
+"glm-5.2" = 2.0
+"deepseek-v4-pro" = 4.0
+"deepseek-v4.1-flash" = 1.0

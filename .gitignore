@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地实测配置（含密钥或内网地址），只发布 config.example.toml
+hdr-gate/tools/config.toml
+
+# 门禁过程产物
+.hdr-gate/
