@@ -178,14 +178,28 @@ def chat(
     *,
     retries: int = 2,
     silent: bool = False,
+    on_event=None,
 ) -> dict:
-    """按角色调用模型，自动走 fallback 链。返回 {text, usage, model, provider, elapsed}。"""
+    """按角色调用模型，自动走 fallback 链。返回 {text, usage, model, provider, elapsed}。
+
+    on_event: 可选回调，接收进度文本（重试/切通道），供上层写进 progress.log。
+    """
     chain = resolve_chain(cfg, role)
     last_err: Exception | None = None
+
+    def emit(msg: str) -> None:
+        log(msg)
+        if on_event:
+            try:
+                on_event(msg.strip())
+            except Exception:
+                pass
 
     for idx, bound in enumerate(chain):
         for attempt in range(retries + 1):
             started = time.time()
+            if attempt:
+                emit(f"  [{role}] 第 {attempt + 1} 次尝试 {bound['provider']}/{bound['model']}")
             try:
                 payload = _post(bound, messages)
                 elapsed = time.time() - started
@@ -213,16 +227,18 @@ def chat(
                 last_err = LLMError(f"{bound['provider']} HTTP {e.code}: {detail}")
                 # 4xx（除 429）不可重试，直接换下一个 provider
                 if e.code in (400, 401, 403, 404) or (400 <= e.code < 500 and e.code != 429):
-                    log(f"  [{role}] {bound['provider']} 返回 {e.code}，切换下一个通道")
+                    emit(f"  [{role}] {bound['provider']} 返回 {e.code}，切换下一个通道")
                     break
+                emit(f"  [{role}] {bound['provider']} 返回 {e.code}，{1.5 * (attempt + 1):.1f}s 后重试")
                 if attempt < retries:
                     time.sleep(1.5 * (attempt + 1))
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError) as e:
                 last_err = LLMError(f"{bound['provider']} 调用失败: {e}")
+                emit(f"  [{role}] {bound['provider']} 调用异常: {e}")
                 if attempt < retries:
                     time.sleep(1.5 * (attempt + 1))
         if idx + 1 < len(chain):
-            log(f"  [{role}] 主通道失败，尝试 fallback: {chain[idx + 1]['provider']}/{chain[idx + 1]['model']}")
+            emit(f"  [{role}] 主通道失败，尝试 fallback: {chain[idx + 1]['provider']}/{chain[idx + 1]['model']}")
 
     raise LLMError(f"角色 {role} 所有通道均失败: {last_err}")
 

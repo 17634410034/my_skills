@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +34,93 @@ import prompts
 HERE = Path(__file__).resolve().parent
 TEMPLATE = HERE.parent / "dev-doc-template.md"
 WORKROOT = Path(".hdr-gate")
+HEARTBEAT_SEC = 20
+
+
+# --------------------------------------------------------------------------
+# 可观测性：心跳 + 进度日志
+#
+# 存在的理由：单次模型调用最坏 = timeout(600s) x (retries+1) = 30 分钟。
+# 如果这 30 分钟里没有任何落地痕迹，「到哪了」这个问题就只能靠问人。
+# 而问人的那一刻，说明编排者已经失去控制权了。
+# --------------------------------------------------------------------------
+
+class Progress:
+    """把一个阶段的开始/心跳/结束写进 progress.log，供 status 与后续会话读取。"""
+
+    def __init__(self, proj: "Project", step: str):
+        self.proj = proj
+        self.step = step
+        self.started = time.time()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def log(self, msg: str) -> None:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{self.step}] {msg}"
+        print(line, flush=True)
+        try:
+            with open(self.proj.path("progress.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def __enter__(self) -> "Progress":
+        self.log(f"开始（pid={os.getpid()}）")
+        self._thread = threading.Thread(target=self._beat, daemon=True)
+        self._thread.start()
+        return self
+
+    def _beat(self) -> None:
+        while not self._stop.wait(HEARTBEAT_SEC):
+            self.log(f"心跳 已等待 {int(time.time() - self.started)}s，仍在等模型响应")
+
+    def ok(self, result: dict) -> None:
+        u = result.get("usage", {}) or {}
+        self.log(
+            f"完成 {result.get('provider')}/{result.get('model')} "
+            f"{result.get('elapsed', 0):.1f}s "
+            f"in={u.get('prompt_tokens', '?')} out={u.get('completion_tokens', '?')} "
+            f"total={int(time.time() - self.started)}s"
+        )
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if exc is None:
+            self.log(f"阶段结束 总耗时 {int(time.time() - self.started)}s")
+        else:
+            self.log(f"阶段失败 {exc!r} 耗时 {int(time.time() - self.started)}s")
+        return False
+
+
+def call_role(proj: "Project", step: str, cfg: dict, role: str, messages: list[dict]) -> dict:
+    with Progress(proj, step) as pg:
+        try:
+            result = llm.chat(cfg, role, messages, on_event=pg.log)
+        except Exception as e:
+            pg.log(f"调用失败：{e}")
+            raise SystemExit(
+                f"{step} 阶段失败：{e}\n"
+                f"  现场留在 {proj.path('progress.log')}，可直接 tail 查看\n"
+                f"  重跑前建议先压上下文：--context <只给关键文件> / --max-context-chars 120000"
+            )
+        pg.ok(result)
+        return result
+
+
+def call_roles_parallel(proj: "Project", step: str, cfg: dict, jobs: list[dict]) -> list[dict]:
+    with Progress(proj, step) as pg:
+        pg.log("并行启动：" + " / ".join(j["role"] for j in jobs))
+        try:
+            res = llm.chat_parallel(cfg, jobs)
+        except Exception as e:
+            pg.log(f"并行调用失败：{e}")
+            raise SystemExit(f"{step} 阶段失败：{e}\n  现场：{proj.path('progress.log')}")
+        for r in res:
+            pg.log(f"返回 {r['provider']}/{r['model']} {r['elapsed']:.1f}s")
+        return res
+
 
 
 # --------------------------------------------------------------------------
@@ -125,7 +214,7 @@ def load_ctx(meta: dict, extra: list[str] | None = None) -> str:
     paths = list(meta.get("context", [])) + (extra or [])
     if not paths and not repo:
         return "（未提供项目上下文；本次判断必须标注为基于文档自身，未验证代码）"
-    return llm.collect_context(paths, repo=repo, max_chars=meta.get("max_context_chars", 300_000))
+    return llm.collect_context(paths, repo=repo, max_chars=meta.get("max_context_chars", 120_000))
 
 
 def cfg_of(meta: dict) -> dict:
@@ -177,6 +266,10 @@ def cmd_init(args) -> None:
 def cmd_draft(args) -> None:
     proj = Project(args.name)
     meta = proj.meta()
+    if proj.path("v0.1.md").exists() and not getattr(args, "force", False):
+        print(f"v0.1.md 已存在（{proj.path('v0.1.md')}），跳过起草。重跑请加 --force")
+        print(f"下一步: python3 hdr.py review --name {args.name}")
+        return
     cfg = cfg_of(meta)
     template = TEMPLATE.read_text(encoding="utf-8")
     ctx = load_ctx(meta, args.context)
@@ -187,7 +280,13 @@ def cmd_draft(args) -> None:
         )
 
     print(f"[1/8] Agent1 正在分析项目并撰写 v0.1（上下文 {len(ctx)} 字符）…")
-    result = llm.chat(cfg, "agent1", prompts.draft_messages(meta["requirement"], ctx, template))
+    if len(ctx) > 150_000:
+        print(
+            f"  ⚠️  上下文 {len(ctx)} 字符偏大：单次调用可能 10 分钟以上。\n"
+            f"     建议先压到 6 万以内（--context 只给关键文件，或 --max-context-chars 60000），\n"
+            f"     细节缺口本来就该由双审和冷读逼出来，不必一次吞完。"
+        )
+    result = call_role(proj, "draft", cfg, "agent1", prompts.draft_messages(meta["requirement"], ctx, template))
     proj.write("v0.1.md", extract_doc(result["text"]))
     proj.add_cost(meta, result, "draft")
     meta["stage"] = "draft"
@@ -219,7 +318,7 @@ def cmd_review(args) -> None:
         {"role": "agent2", "messages": prompts.review_feasibility_messages(doc, ctx)},
         {"role": "agent3", "messages": prompts.review_correctness_messages(doc, ctx)},
     ]
-    res = llm.chat_parallel(cfg, jobs)
+    res = call_roles_parallel(proj, "review", cfg, jobs)
     proj.write("review-a.md", res[0]["text"])
     proj.write("review-b.md", res[1]["text"])
     for r in res:
@@ -241,7 +340,7 @@ def cmd_merge(args) -> None:
     b = proj.read("review-b.md")
 
     print("[3/8] Agent4(flash) 机械归并…")
-    result = llm.chat(cfg, "agent4", prompts.merge_messages(a, b))
+    result = call_role(proj, "merge", cfg, "agent4", prompts.merge_messages(a, b))
     proj.write("merged.md", result["text"])
     proj.add_cost(meta, result, "merge")
     meta["stage"] = "merge"
@@ -260,7 +359,7 @@ def cmd_fix(args) -> None:
     merged = proj.read(args.merged)
 
     print("[4/8] Agent1 一次性修复…")
-    result = llm.chat(cfg, "agent1", prompts.fix_messages(doc, merged))
+    result = call_role(proj, "fix", cfg, "agent1", prompts.fix_messages(doc, merged))
     table = extract_table(result["text"])
     if table:
         proj.write("fix-table.md", table)
@@ -293,7 +392,7 @@ def cmd_sign(args) -> None:
             "messages": prompts.sign_messages(doc, proj.read("review-b.md"), resolution, "correctness"),
         },
     ]
-    res = llm.chat_parallel(cfg, jobs)
+    res = call_roles_parallel(proj, "sign", cfg, jobs)
     ok_a, why_a = parse_signoff(res[0]["text"])
     ok_b, why_b = parse_signoff(res[1]["text"])
 
@@ -338,11 +437,11 @@ def cmd_coldread(args) -> None:
 
     role = "coldread"
     if meta.get("repo") is None and args.context:
-        ctx = llm.collect_context(args.context, repo=None, max_chars=meta.get("max_context_chars", 300_000))
+        ctx = llm.collect_context(args.context, repo=None, max_chars=meta.get("max_context_chars", 120_000))
 
     print("[7/8] 冷读试跑：陌生视角，只给文档 + 代码，不许提问…")
     print(f"  模型: {cfg['roles'][role]['provider']}/{cfg['roles'][role]['model']}")
-    result = llm.chat(cfg, role, prompts.coldread_messages(doc, ctx, meta.get("repo")))
+    result = call_role(proj, "coldread", cfg, role, prompts.coldread_messages(doc, ctx, meta.get("repo")))
     proj.write("coldread.md", result["text"])
     proj.add_cost(meta, result, "coldread")
     meta["stage"] = "coldread"
@@ -365,7 +464,7 @@ def cmd_finalize(args) -> None:
     gaps = proj.read("coldread.md")
 
     print("[8/8] Agent1 按缺口补齐（只增信息，不改方案）…")
-    result = llm.chat(cfg, "agent1", prompts.finalize_messages(doc, gaps))
+    result = call_role(proj, "finalize", cfg, "agent1", prompts.finalize_messages(doc, gaps))
     table = extract_table(result["text"])
     if table:
         proj.write("finalize-table.md", table)
@@ -417,6 +516,27 @@ def cmd_status(args) -> None:
         print("\n调用记录:")
         for h in meta["history"]:
             print(f"  {h['at']}  {h['step']:<10} {h['role_model']:<28} {h['elapsed']}s")
+
+    # 进度日志：回答「现在到底在跑，还是已经死了」
+    plog = proj.path("progress.log")
+    if plog.exists():
+        lines = [ln for ln in plog.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        idle = time.time() - plog.stat().st_mtime
+        if lines:
+            print("\n最近进度:")
+            for ln in lines[-4:]:
+                print(f"  {ln}")
+            running = "阶段结束" not in lines[-1] and "失败" not in lines[-1]
+            if running:
+                if idle > HEARTBEAT_SEC * 3:
+                    print(f"\n  ⚠️  最后一条日志是 {int(idle)}s 前，超过 3 个心跳周期 → 进程可能已死")
+                    print("     先确认存活: ps -p $(sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p' "
+                          f"{plog} | tail -1)")
+                else:
+                    print(f"\n  ⏳ 仍在运行（最后心跳 {int(idle)}s 前）")
+            else:
+                print("\n  该阶段已结束")
+
 
 
 def cmd_doctor(args) -> None:
@@ -549,7 +669,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--req-file", help="需求文件路径")
     sp.add_argument("--context", nargs="*", help="额外上下文文件或目录")
     sp.add_argument("--config", help="配置文件路径")
-    sp.add_argument("--max-context-chars", type=int, default=300_000)
+    sp.add_argument("--max-context-chars", type=int, default=120_000,
+                    help="上下文上限（默认 12 万字符 ≈ 4 万 token）。超 15 万单次调用会很久")
     sp.add_argument("--force", action="store_true")
     sp.add_argument(
         "--assume",
@@ -561,6 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("draft", cmd_draft, "阶段1：分析 + v0.1")
     sp.add_argument("--name", required=True)
     sp.add_argument("--context", nargs="*")
+    sp.add_argument("--force", action="store_true", help="已存在 v0.1.md 时也重跑（默认跳过，便于断点续跑）")
 
     sp = add("review", cmd_review, "阶段2：双审并行")
     sp.add_argument("--name", required=True)
