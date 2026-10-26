@@ -49,7 +49,7 @@ timeout = 600
 # family：模型族，决定异质性判定。可省略，省略时按 model 名自动推断
 # fallback：主通道 401/404/超时 时自动切过去
 
-# ⚠️ 推理型模型会把 max_tokens 花在思维链上：配低了不会报错，而是返回空正文（content=""、finish_reason=length），产物落成 0-2 字节空文件。审稿人/冷读者建议 20000。
+# ⚠️ 推理型模型会把 max_tokens 花在思维链上：配低了不会报错，而是返回空正文（content=""、finish_reason=length），产物落成 0-2 字节空文件。**实测 20000 仍不够**：审稿/签署用 32000、冷读用 40000，并配合 prompts 里的 OUTPUT_TERSE_* 压正文体量；只提配额不压体量照样空手而归。
 [roles.agent1]                 # 作者：分析、写文档、修复、补齐
 provider = "tokenplan"
 model = "qwen3.8-max"
@@ -61,7 +61,7 @@ max_tokens = 32000
 provider = "dashscope"
 model = "qwen3-max"
 
-# 可行性审稿人：输出是清单，20000 给推理链留余量
+# 可行性审稿人：正文是清单，32000 给思维链留余量（20000 实测会空返回）
 [roles.agent2]                 # 可行性审稿人：能不能照着落地 + 信息完备性
 provider = "tokenplan"
 model = "glm-5.3"
