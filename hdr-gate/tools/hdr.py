@@ -241,9 +241,16 @@ def count_gaps(text: str) -> int:
 # 每个阶段的产物都必须「像被认真写过」。空产物几乎都源于推理模型把
 # max_tokens 花在思维链上（content 空），落盘后会得到 0-2 字节的文件，
 # 让后续阶段拿垃圾当输入。宁可在这里炸掉，也不要往下传。
+RETRY_TARGETS = {
+    # stage: (角色, 产物文件, 所属阶段)
+    "review-a": ("agent2", "review-a.md", "review"),
+    "review-b": ("agent3", "review-b.md", "review"),
+    "merge": ("agent4", "merged.md", "merge"),
+    "coldread": ("coldread", "coldread.md", "coldread"),
+}
+
 ARTIFACT_RULES = {
-    "review-a.md": (120, r"\[P[012]-"),
-    "review-b.md": (120, r"\[P[012]-"),
+    "review-a.md": (120, r"\[P[012]-"),    "review-b.md": (120, r"\[P[012]-"),
     "merged.md": (120, r"溯源|归入"),
     "coldread.md": (120, r"GAP-\d+|复述"),
     "v0.2.md": (2000, None),
@@ -269,6 +276,33 @@ def require_artifact(proj: "Project", filename: str, text: str, *, step: str) ->
             f"请检查 prompt 是否被模型改写，或重跑该阶段。"
         )
     return body
+
+
+def stamp_frontmatter(doc: str, *, version: str, status: str) -> str:
+    """落 v0.3 时同步 frontmatter。
+
+    2026-10-26 实测坑：`sign` 通过后把 v0.2 原文复制成 v0.3.md，正文里仍写着
+    `doc_version: v0.2 / status: under-review`。接手方读到会判定「这份还没审完」，
+    而交付话术里又声称双签通过 —— 版本自相矛盾只能靠人肉补。
+    """
+    if not doc.startswith("---"):
+        return doc
+    end = doc.find("\n---", 3)
+    if end < 0:
+        return doc
+    fm = doc[3:end]
+
+    def _set(key: str, value: str) -> None:
+        nonlocal fm
+        pat = re.compile(rf"^{key}:.*$", re.M)
+        if pat.search(fm):
+            fm = pat.sub(f"{key}: {value}", fm, count=1)
+        else:
+            fm = f"{fm}\n{key}: {value}"
+
+    _set("doc_version", version)
+    _set("status", status)
+    return "---\n" + fm.strip("\n") + "\n" + doc[end + 1 :]
 
 
 def load_ctx(meta: dict, extra: list[str] | None = None) -> str:
@@ -522,11 +556,14 @@ def cmd_sign(args) -> None:
         proj.add_cost(meta, r, "sign")
 
     if ok_a and ok_b:
-        proj.write("v0.3.md", doc)
-        proj.write(f"v0.3.round{round_no}.md", doc)
+        signed = stamp_frontmatter(doc, version="v0.3", status="handoff-ready")
+        proj.write("v0.3.md", signed)
+        proj.write(f"v0.3.round{round_no}.md", signed)
         meta["stage"] = "signoff"
         proj.save_meta(meta)
-        print(f"  ✅ 双签通过（第 {round_no} 轮）→ v0.3.md（本轮存档 v0.3.round{round_no}.md）")
+        print(f"  ✅ 双签通过（第 {round_no} 轮）→ v0.3.md（frontmatter 已同步为 v0.3/handoff-ready）")
+        print("  ⚠️  双签里若有「非阻塞知会项」（P1/P2 的内部矛盾、统计遗漏），必须在 coldread 前先修掉：")
+        print(f"     它们不会挡住签署，但会让冷读者和接手方卡住。逐条写进 v0.3 的版本记录。")
         print(f"下一步: python3 hdr.py coldread --name {args.name}")
     else:
         meta["stage"] = "signoff-failed"
@@ -574,11 +611,58 @@ def cmd_coldread(args) -> None:
 
     gaps = count_gaps(result["text"])
     print(f"  → {proj.path('coldread.md')}  缺口 GAP×{gaps}")
+    print("  ⚠️  这一路是纯 API 冷读，**没有仓库读权限**：它报不出「文档对仓库的每一处事实断言是否成立」")
+    print("     （行号漂移、符号不存在、命令跑不通）。必须再派一个宿主侧、全新上下文、")
+    print("     只读但有仓库权限的执行者做第二次冷读，两份缺口合并后才进 finalize —— 见 SKILL 第 7 步「双冷读」。")
     if gaps:
         print("  ⚠️  有缺口：属信息缺失 → finalize 补齐；属方案缺陷 → 回 fix 改方案后重走 sign/coldread")
     else:
         print("  ✅ 无缺口")
     print(f"下一步: python3 hdr.py finalize --name {args.name}")
+
+
+def cmd_retry(args) -> None:
+    """重跑单个角色的调用 —— 空正文/被截断时的唯一正道。
+
+    2026-10-26 的教训：agent2 首跑返回 2 字节、coldread 返回 0 字节，当时手写
+    临时 python 脚本调 `llm.chat` 重试，结果是**成本不入账、require_artifact
+    校验被绕过、progress.log 断档**。这个命令把那条路收编回来。
+    """
+    proj = Project(args.name)
+    meta = proj.meta()
+    cfg = cfg_of(meta)
+    role, out, step = RETRY_TARGETS[args.stage]
+    if role not in cfg.get("roles", {}):
+        raise SystemExit(f"配置里没有角色 {role}")
+    if args.max_tokens:
+        cfg["roles"][role]["max_tokens"] = args.max_tokens
+    doc = proj.read(args.doc)
+
+    if args.stage in ("review-a", "review-b"):
+        ctx = load_ctx(meta)
+        msgs = (
+            prompts.review_feasibility_messages(doc, ctx)
+            if args.stage == "review-a"
+            else prompts.review_correctness_messages(doc, ctx)
+        )
+    elif args.stage == "merge":
+        msgs = prompts.merge_messages(proj.read("review-a.md"), proj.read("review-b.md"))
+    else:
+        ctx = load_ctx(meta) if args.with_context else "（冷读纯净模式：不提供任何项目上下文）"
+        msgs = prompts.coldread_messages(doc, ctx, None)
+
+    spec = cfg["roles"][role]
+    print(f"[retry] {args.stage} → {spec['provider']}/{spec['model']} max_tokens={spec['max_tokens']}")
+    result = call_role(proj, f"retry:{args.stage}", cfg, role, msgs)
+    require_artifact(proj, out, result["text"], step=f"retry:{args.stage}")
+    proj.write(out, result["text"])
+    proj.add_cost(meta, result, f"retry:{args.stage}")
+    proj.save_meta(meta)
+    print(f"  → {proj.path(out)}  {len(result['text'])} 字符，成本已入账")
+    if args.stage == "coldread":
+        print(f"     缺口 GAP×{count_gaps(result['text'])}，下一步 finalize")
+    else:
+        print(f"     下一步：继续原阶段（{out} 已就位）")
 
 
 def cmd_finalize(args) -> None:
@@ -835,6 +919,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="把项目上下文/作者事实底稿一起喂给冷读者（削弱陌生度，默认关闭）",
     )
+
+    sp = add("retry", cmd_retry, "重跑单个角色（空正文/被截断时用，成本照常入账）")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--stage", required=True, choices=sorted(RETRY_TARGETS))
+    sp.add_argument("--doc", default="v0.3.md", help="喂给该角色的文档，默认 v0.3.md；重跑双审传 v0.1.md")
+    sp.add_argument("--max-tokens", type=int, help="临时提高该角色配额（推理链吃满正文时第一招）")
+    sp.add_argument("--with-context", action="store_true", help="仅 coldread：附带项目上下文")
 
     sp = add("finalize", cmd_finalize, "阶段8：补齐定稿")
     sp.add_argument("--name", required=True)

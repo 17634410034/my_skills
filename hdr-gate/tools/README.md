@@ -87,6 +87,9 @@ python3 hdr.py merge     --name X                          # 阶段3 → 合并 
 python3 hdr.py fix       --name X                          # 阶段4 → v0.2
 python3 hdr.py sign      --name X                          # 阶段6 → 双签 → v0.3
 python3 hdr.py coldread  --name X                          # 阶段7 → 缺口清单
+python3 hdr.py retry     --name X --stage coldread --max-tokens 40000
+                                                        # 空正文/被截断时重跑单个角色（成本照常入账）
+                                                        # stage ∈ review-a | review-b | merge | coldread
 python3 hdr.py finalize  --name X                          # 阶段8 → 交付 <需求名>.md
 python3 hdr.py status    --name X                          # 看进度和花费
 python3 hdr.py run       --name X --auto                   # 一条龙
@@ -214,7 +217,16 @@ model = "glm-5.3"
 
 **4. 产物 0–2 字节的空文件 ≠ 模型不可用**
 推理型模型（`glm-5.x` / `deepseek-v4-pro` / `qwen3.x` 思考档）会把 `max_tokens` 花在思维链上，正文 `content` 返回空串、`finish_reason=length`。`llm.py` 只取 `content`，早期版本会把空产物直接落盘、让下一阶段拿垃圾当输入。现在：空正文会报错并在 `progress.log` 打出 `out= / reasoning=`，各阶段落盘前还会校验非空 + 期望标记。
-**处置**：把该角色 `max_tokens` 提到 20000（config 已默认），并在 prompt 末尾追加输出体量硬约束（条数上限 / 字数上限 / 禁止复述原文）。
+**处置**：`prompts.py` 已把 `OUTPUT_TERSE_REVIEW / _SIGN / _COLD`（条数上限、字数上限、禁止复述原文）硬编进这三个角色的 system，配额默认也提到 **agent2/agent3=32000、agent4=24000、coldread=40000**。2026-10-26 实测：20000 时 glm-5.3 评审返回 2 字节、glm-5.2 冷读返回 0 字节；32000/40000 + 体量约束后两者都拿到完整正文（542s / 184s）。**只提配额不压体量，模型会在思维链里写到撞顶，照样空手而归。**
+仍不够时用 `hdr.py retry`（它会走 `require_artifact` 校验并正常记账，**不要手写脚本调 `llm.chat`**）：
+```bash
+python3 hdr.py retry --name X --stage review-a --doc v0.1.md  --max-tokens 40000
+python3 hdr.py retry --name X --stage coldread --doc v0.3.md  --max-tokens 48000
+```
+
+**4.5 冷读必须跑两路（`coldread` 只覆盖了其中一路）**
+`hdr.py coldread` 是纯 API 调用，**没有仓库读权限**：它只能报「文档没告诉我 X」，报不出「文档写的 `file:行号` / 函数签名 / 命令在仓库里其实不成立」。后者是接手方损失最大的一类缺陷，且冷读清单再长也不会自己冒出来。
+**第二路用宿主侧全新上下文的只读 subagent 跑**（prompt 要点见 SKILL 第 7 步），要求它单列 `## 事实性错误` 一节，格式 `文档的主张 | 仓库实况 | 证据 file:line`。`coldread` 结束时工具会打印这条提醒，别跳过。
 
 **5. `draft` / `fix` / `finalize` 用 API 起草整份长文档，几乎必超时**
 非流式调用的墙钟时间由**输出长度**决定：一次生成 1–3 万 token 的完整文档，压上下文、降 `max_tokens`、抬 `timeout` 都救不了（实测 22K 字符上下文 + 14000 上限 + 900s，仍在 1000s 后无响应）。
