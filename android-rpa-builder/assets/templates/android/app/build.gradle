@@ -1,0 +1,58 @@
+plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+
+android {
+    namespace '<NAMESPACE>'                 // 代码包名
+    // 关键：外部工具链（adb / appops / 文档）只认 applicationId，二者不同时必须文档标注
+    buildFeatures { buildConfig true }
+
+    defaultConfig {
+        applicationId "<APP_ID>"
+        minSdk 24                            // dispatchGesture 下限
+        compileSdk 36
+        targetSdk 36
+        versionCode 1
+        versionName "1.0.0"
+        buildConfigField "int", "DEVICE_PORT", "<DEVICE_PORT>"      // 如 9527
+        buildConfigField "String", "TARGET_PKG", "\"<TARGET_PKG>\""
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // 签名从仓库外文件读取；缺失则 release 不签名（不要提交 keystore 与口令）
+    def keystoreFile = rootProject.file("keystore.properties")
+    if (keystoreFile.exists()) {
+        def p = new Properties(); keystoreFile.newDataInputStream().with { p.load(it); it.close() }
+        signingConfigs { release {
+            storeFile file(p.storeFile); storePassword p.storePassword
+            keyAlias p.keyAlias; keyPassword p.keyPassword
+        } }
+        buildTypes.release.signingConfig signingConfigs.release
+    }
+    buildTypes {
+        debug { minifyEnabled false }
+        release {
+            // 打开 R8 前先枚举反射点（JSON 映射、无障碍回调）
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        // CronSchedule 使用 java.time；minSdk 24 必须开脱糖，否则 API 24/25 运行期 NoClassDefFoundError
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions { jvmTarget = '1.8' }
+    // 刻意不开启 unitTests.returnDefaultValues：强制"判定函数必须是纯 JVM 函数"
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    // 设备令牌走 EncryptedSharedPreferences（蓝图第 2.9 项），不要改成明文 prefs
+    implementation 'androidx.security:security-crypto:1.0.0'
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20231013'    // 让单测能用 org.json
+}

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RPA Runner</string>
+    <string name="accessibility_service_description">在本机目标应用内执行你授权的自动化操作。日志与控件树只保存在本机。</string>
+</resources>
