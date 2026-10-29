@@ -1,7 +1,6 @@
 package <NAMESPACE>.service
 
 import android.util.Log
-import <NAMESPACE>.RpaApplication
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -46,7 +45,7 @@ abstract class PollerBase(
             if (!endpointsReady()) { skip("后端地址未配置"); return }
             val svc = RpaAccessibilityService.instance
             if (svc == null) { skip(RpaAccessibilityService.NOT_CONNECTED); return }
-            if (RpaAccessibilityService.rpaAppVisible || svc.currentPackage == RpaApplication.instance.packageName) {
+            if (svc.isSelfForeground()) {
                 skip("RPA App 在前台"); return
             }
             val acquired = lock.tryRun("poller:$name") { runOneCycle() }

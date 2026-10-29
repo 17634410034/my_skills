@@ -74,15 +74,19 @@ class RpaAccessibilityService : AccessibilityService() {
         Log.i(TAG, "无障碍服务已连接，窗口白名单=${windowPackages().joinToString(",")}")
     }
 
-    /** 前台页面缓存值，仅在 WINDOW_STATE_CHANGED 更新，不可当实时真值（第 3.4 节）。 */
-    var currentPackage: String = "" ; private set
-    var currentClassName: String = "" ; private set
+    /**
+     * 最近一次 WINDOW_STATE_CHANGED 的包名/类名，**仅供日志与诊断**。
+     * 服务重连后它可能长期停在旧值：拿它判断"谁在前台"会让轮询器空转、返回键失效
+     * （真实项目各踩一次，见 references/pitfalls.md P6）。前台归属一律走 [isSelfForeground]。
+     */
+    @Volatile var lastEventPackage: String = "" ; private set
+    @Volatile var lastEventClassName: String = "" ; private set
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        (event.packageName?.toString() ?: return).let { currentPackage = it }
-        event.className?.toString()?.takeIf { it.contains(".") }?.let { currentClassName = it }
+        (event.packageName?.toString() ?: return).let { lastEventPackage = it }
+        event.className?.toString()?.takeIf { it.contains(".") }?.let { lastEventClassName = it }
     }
 
     override fun onInterrupt() { Log.w(TAG, "无障碍服务被中断") }
@@ -96,6 +100,23 @@ class RpaAccessibilityService : AccessibilityService() {
     fun getRootNode(): AccessibilityNodeInfo? = try { rootInActiveWindow } catch (e: Exception) {
         Log.e(TAG, "rootInActiveWindow 失败: ${e.message}"); null
     }
+
+    // ---------------- 前台归属（实时，不看缓存） ----------------
+
+    /** 实时前台包名，以活动窗口根节点为准；读不到返回 null。 */
+    fun livePackageName(): String? = liveRootField { it.packageName?.toString() }
+
+    fun liveClassName(): String? = liveRootField { it.className?.toString() }
+
+    private fun liveRootField(read: (AccessibilityNodeInfo) -> String?): String? = try {
+        getRootNode()?.let(read)
+    } catch (e: Exception) {
+        Log.w(TAG, "读取实时根节点失败: ${e.message}"); null
+    }
+
+    /** RPA 自己是否在前台：Activity 可见标志 + 实时根节点双信号。 */
+    fun isSelfForeground(): Boolean =
+        rpaAppVisible || livePackageName() == packageName
 
     /** 按 id 查找：活动窗口未命中则自动跨窗口兜底（第 3.3 节第 1 条）。 */
     fun findById(resourceId: String): List<AccessibilityNodeInfo> {
@@ -306,23 +327,19 @@ class RpaAccessibilityService : AccessibilityService() {
     fun openNotifications(): Boolean = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
 
     /**
-     * RPA 自己在前台时拒绝按返回（三重信号：可见标志 → 缓存包名 → 实时根节点包名）。
+     * RPA 自己在前台时拒绝按返回（Activity 可见标志 + 实时根节点）。
      * 没有这层保护，自动化会把手机按回桌面。
      */
     fun safePressBack(): Boolean {
-        if (rpaAppVisible) { Log.w(TAG, "RPA App 在前台，拒绝返回键"); return false }
-        if (currentPackage == packageName) { Log.w(TAG, "缓存包名为自身，拒绝返回键"); return false }
-        if (getRootNode()?.packageName?.toString() == packageName) {
-            Log.w(TAG, "实时根节点为自身，拒绝返回键"); return false
-        }
+        if (isSelfForeground()) { Log.w(TAG, "RPA App 在前台，拒绝返回键"); return false }
         return performGlobalAction(GLOBAL_ACTION_BACK)
     }
 
-    fun isTargetForeground(): Boolean = currentPackage == "<TARGET_PKG>"
+    /** 目标 App 是否在前台（实时根节点；读不到即按"否"处理，失败要闭不回放）。 */
+    fun isTargetForeground(): Boolean = livePackageName() == "<TARGET_PKG>"
 
     /** 实时根包名校验，防止把别的 App 的文本当目标 App 命中。 */
-    fun hasTargetAccessibilityRoot(): Boolean =
-        getRootNode()?.packageName?.toString() == "<TARGET_PKG>"
+    fun hasTargetAccessibilityRoot(): Boolean = isTargetForeground()
 
     // ---------------- 等待（第 3.2 节） ----------------
 
@@ -388,7 +405,9 @@ class RpaAccessibilityService : AccessibilityService() {
         val sb = StringBuilder()
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA)
         sb.append("capturedAt=").append(fmt.format(System.currentTimeMillis())).append('\n')
-        sb.append("pkg=").append(currentPackage).append(" activity=").append(currentClassName).append('\n')
+        sb.append("pkg=").append(livePackageName() ?: "-")
+            .append(" lastEventPkg=").append(lastEventPackage)
+            .append(" activity=").append(liveClassName() ?: lastEventClassName).append('\n')
         var visited = 0
         fun walk(node: AccessibilityNodeInfo?, depth: Int) {
             if (node == null || visited++ > maxNodes || depth > maxDepth) return

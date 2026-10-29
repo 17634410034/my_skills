@@ -25,6 +25,11 @@ description: Android 无障碍 RPA 项目构建器：基于 AccessibilityService
 
 判断不清时先做 Phase 0 的可行性三问（`references/kickoff.md`），**不要先写代码**。
 
+**问 1 必须用 5 分钟预检回答，不许凭经验判断**：脚手架还没落地时，用 `adb shell uiautomator dump`
+抓一次目标 App 首页即可（此时还没有自己的无障碍服务，不存在抢窗口问题；RPA 服务一上线就恢复禁令）。
+抓到的节点树若"页面上满是文字、XML 里却没几个节点" → 控件树被隐藏，直接按 `adaptation.md` 5.10
+的降级通道立项。真实案例：微信 8.0.52+ 就是这样，没做预检导致整架构返工。
+
 ---
 
 ## 硬规则（违反即返工）
@@ -39,9 +44,13 @@ description: Android 无障碍 RPA 项目构建器：基于 AccessibilityService
 8. **一个语义一个当前 ID**：禁止 `_PREVIOUS/_OLD/_LEGACY/_CURRENT/_LATEST/_NEW`；历史只靠 Git；ID 改动必须证据齐全且过 guard。
 9. **失败是常态**：流程返回 `Boolean` 或结果 DTO（带人类可读 `message`），不抛异常；每个失败点附取证载荷（可见文本摘要 + 窗口概览）。
 10. **密钥不外泄**：设备 HTTP 必须鉴权（空令牌只放行回环）；日志写入时脱敏；任何回显端点不回密钥；密钥走 `EncryptedSharedPreferences`；日志/证据不入仓库。
-11. **取证三禁令**：禁止 `uiautomator dump`；`busy=true` 时不 dump / 不截图 / 不点击；中文输入禁用 `adb shell input text`。
+11. **取证三禁令**：禁止 `uiautomator dump`（**唯一例外**是 Phase 0 预检，此时还没有自己的无障碍服务）；`busy=true` 时不 dump / 不截图 / 不点击；中文输入禁用 `adb shell input text`。
 12. **只覆盖安装**：永不卸载、永不清数据（卸载会丢无障碍授权与设备身份）。
 13. **不动用户仓库的 git**：只在用户指定目录写文件；不 `git init`、不建分支、不提交，除非用户明确要求。
+14. **前台归属只信实时信号**：判断"谁在前台"必须用实时根节点 + Activity 可见标志；`TYPE_WINDOW_STATE_CHANGED` 的包名只许进日志。服务重连后缓存可能长期停在旧值——真实项目里同一个坑让**轮询器空转**和**返回键失效**各一次。
+15. **一次判定只截一次屏**：同一次页面判定里截两次屏会触发系统限频，OCR 返回空后被误判成"页面不对"。截图一次，尺寸与 OCR 共用。
+16. **感知通道可降级、不可伪造**：控件树不可读时按 `adaptation.md` 5.10 走「通知读 / 截图 OCR 看 / 自建输入法写 / 手势点」。禁止伪装包名、注入事件等绕过目标 App 防护的手段。
+17. **外部事件验收项一次转交**：只能由真人或外部事件触发的验收（真实来信、真实回调），交付时一次性列成清单 + 一条自检命令交给用户触发。**不得反复空等、反复催促**。
 
 ---
 
@@ -49,7 +58,7 @@ description: Android 无障碍 RPA 项目构建器：基于 AccessibilityService
 
 | 阶段 | 做什么 | 门禁（真跑） | 详读 |
 |---|---|---|---|
-| Phase 0 | 可行性三问 + 16 项立项决策 + 一次问完参数 | 三问全过；决策表填满 | `references/kickoff.md` |
+| Phase 0 | 可行性三问 + 16 项立项决策 + 一次问完参数 | 三问全过；**5 分钟控件树预检跑过**；决策表填满 | `references/kickoff.md` |
 | Phase 1 | 脚手架生成 + 编译 + 单测 | `scaffold.py check` PASS；`assembleDebug`；`testDebugUnitTest` | `references/build-phases.md` |
 | Phase 2 | 权限、常驻、自愈三源 | 免 USB 可访问；杀进程/关无障碍/重启各测一次 | `references/build-phases.md` |
 | Phase 3 | 可观测与取证工具链 | `dump_ui` 非空；`logs` 已脱敏；`capture-context.sh` 退出码 0 | `references/build-phases.md` |
@@ -58,7 +67,19 @@ description: Android 无障碍 RPA 项目构建器：基于 AccessibilityService
 | Phase 6 | 任务实现、后端契约、幂等重试 | 重试矩阵；幂等；超时逐层放大 | `references/build-phases.md` |
 | Phase 7 | 验收与交接 | 24h 观测；安全表；README/runbook/已知限制 | `references/acceptance.md` |
 
-**中途踩坑先查** `references/pitfalls.md`（13 条反模式 + 厂商 ROM 预算 + Android 15 前台服务限制）。
+**中途踩坑先查** `references/pitfalls.md`（反模式自查表 + 厂商 ROM 预算 + Android 15 前台服务限制 + 真实案例复盘 P6）。
+
+---
+
+## 收尾（Phase 7 之后）
+
+两件事只能由真机与外部条件触发，**不要在会话里干等**：
+
+- **外部事件项**（真实来信 / 真实回调）：列一张「待用户触发」清单 + 一条自检命令，一次交出去；
+  之后最多复核一次。反例：真实项目里为等一条微信来信反复监听十余轮，全部空耗。
+- **24h 观测**：必须跑满。中途重启要能归因——启动日志记「启动原因 + 上次心跳时间 + 版本号」；
+  归因不了就写「未定位」，不许猜成「偶发、正常」。
+- **验收矩阵全绿后停止扩张**：不再自行追加加固项；确有价值的先说明收益并征得同意。
 
 ---
 
@@ -119,14 +140,14 @@ SECONDARY_TARGET_PKG/DEVICE_PORT/HOST_PORT` 等占位符 → 写 `.rpa-scaffold.
 JS 风格正则字面量、KDoc 里的 `*/`、`minSdk 24` 配 `java.time` 缺脱糖、`TaskController` 构造参数类型不匹配、
 以及一批被引用但没给实现的类。
 
-**用脚手架，不要手工粘。** 完整修正清单（D1–D22）与实测证据在 `references/build-phases.md`
+**用脚手架，不要手工粘。** 完整修正清单（D1–D28）与实测证据在 `references/build-phases.md`
 「模板相对蓝图的修正清单」。
 
 ---
 
 ## 反模式速查（详表见 `references/pitfalls.md`）
 
-- 用 `uiautomator dump` 取控件树 → 抢占无障碍窗口，服务挂起。
+- 用 `uiautomator dump` 取控件树 → 抢占无障碍窗口，服务挂起（**仅 Phase 0 预检例外**，见上）。
 - `busy=true` 时 dump / 截图 / 点击 → 被模板拦成 409，别绕过。
 - 中文用 `adb shell input text` → 乱码。
 - 失败立刻重试"结果未知"的发送 → 重复发给真人。
@@ -136,6 +157,11 @@ JS 风格正则字面量、KDoc 里的 `*/`、`minSdk 24` 配 `java.time` 缺脱
 - 空令牌图省事 → 生产必须配令牌，否则仅回环。
 - 无人值守前不跑 24h 观测 → 6h FGS 限时、appop 回滚都只在长跑里暴露。
 - 未询问就建分支/提交/推送 → 禁止。
+- 用事件缓存的包名判断"谁在前台" → 轮询器空转、返回键失效。
+- 同一判定点截两次屏 → 系统限频，OCR 返空被误判。
+- 7×24 用 `dataSync` 前台服务 → Android 15 六小时额度耗尽即停。
+- 看到通知正文就当真 → 关闭「显示消息详情」后是占位文本，关键词永不命中。
+- 等真实事件等十几轮 → 一次转交即可，别空耗。
 
 ---
 
@@ -145,10 +171,10 @@ JS 风格正则字面量、KDoc 里的 `*/`、`minSdk 24` 配 `java.time` 缺脱
 |---|---|
 | `references/blueprint.md` | **规范原文**（第 1–11 章：六层架构、逐子系统规格、UI 引擎、编排、适配方法论、反模式、参考实现、占位符字典）。需要细节时按章查；第 9 章的参考实现已抽成 `assets/templates/`，不要直接粘贴 |
 | `references/kickoff.md` | Phase 0：需求卡、可行性三问、16 项立项决策、参数默认值 |
-| `references/build-phases.md` | Phase 1–7 施工手册：动作 / 门禁命令 / 停止线 / 模板修正清单 D1–D22 |
-| `references/adaptation.md` | Phase 5：A1→D2、五步证据法、ID 登记表、guard、跨 App 文件传递 |
-| `references/acceptance.md` | Phase 7：验收矩阵、24h 观测、安全自检、交接物 |
-| `references/pitfalls.md` | 反模式、厂商 ROM、Android 15 前台服务限制、禁止区 |
+| `references/build-phases.md` | Phase 1–7 施工手册：动作 / 门禁命令 / 停止线 / 模板修正清单 D1–D28 |
+| `references/adaptation.md` | Phase 5：A1→D2、五步证据法、ID 登记表、guard、跨 App 文件传递、**控件树不可读时的降级通道（5.10）** |
+| `references/acceptance.md` | Phase 7：验收矩阵、24h 观测、生产触发路径、外部事件项、安全自检、交接物 |
+| `references/pitfalls.md` | 反模式、厂商 ROM、Android 15 前台服务限制、禁止区、**真实案例复盘 P6** |
 | `assets/templates/` | 可直接生成的工程骨架（Kotlin + 脚本），占位符为 `<UPPER_CASE>` |
 | `scripts/scaffold.py` | 生成与自检脚手架（零第三方依赖，Python 3.9+） |
 
@@ -159,6 +185,12 @@ JS 风格正则字面量、KDoc 里的 `*/`、`minSdk 24` 配 `java.time` 缺脱
 - 2026-10-27，本机 Gradle 8.4 + AGP 8.2.2 + JDK 17：脚手架生成的工程在
   `compileSdk 34/36` 两种配置下均 `BUILD SUCCESSFUL`，`testDebugUnitTest` 3/3 通过，
   产物 `app-debug.apk` 约 7 MB。
+- 2026-10-29，修正 D23–D28（实时前台判定、`specialUse` 前台服务、占位符误报、深链兜底、
+  进程启动日志）后重跑：`BUILD SUCCESSFUL`、单测 3/3、`scaffold.py check` PASS、
+  APK 6.7 MB；二次目标 App 与 `BuildConfig.TARGET_PKG` 白名单写法均验证通过。
+- 真实项目证据（2026-10，微信自动回复，约 3700 行 Kotlin）：`targetSdk 36` + 微信 8.0.79 真机，
+  控件树被隐藏，改走「通知 + 截图 OCR + 自建输入法」，一键验收 10/10，真实来信 14 秒自动回复。
+  这只证明该路径可行，**不代表本模板已在真机验证**。
 - **未验证**：真机安装、权限引导、无障碍连接、UI 链路、24h 稳定性——这些必须在 Phase 2/7 于目标真机完成。
 - 蓝图的 `compileSdk/targetSdk 36` 与 `AGP 8.2.2` 组合可用（会有版本提示）；若本机未装 SDK 36，
   用 `--compile-sdk/--target-sdk` 降到已安装版本，`minSdk 24` 不要动（`dispatchGesture` 下限）。

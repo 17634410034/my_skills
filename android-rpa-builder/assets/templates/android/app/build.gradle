@@ -14,6 +14,7 @@ android {
         versionName "1.0.0"
         buildConfigField "int", "DEVICE_PORT", "<DEVICE_PORT>"      // 如 9527
         buildConfigField "String", "TARGET_PKG", "\"<TARGET_PKG>\""
+        buildConfigField "String", "SECONDARY_TARGET_PKG", "\"<SECONDARY_TARGET_PKG>\""   // 无次要目标时该行会被脚手架删除
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 

@@ -40,8 +40,8 @@
 
 | 事实 | 影响 | 处理 |
 |---|---|---|
-| `dataSync` 型前台服务在 Android 15 有 **6 小时/24h 累计上限** | 7×24 无人值守会被系统在额度用尽后停止 | 评估改用 `specialUse`（旁加载可用；上架需在 Play 申报用途）或把 `targetSdk` 保持在 34；**上线前在目标 ROM 真机跑够 24h 观测** |
-| Android 15 限制从 `BOOT_COMPLETED` 拉起部分 FGS 类型（含 `dataSync`） | 开机自启可能抛 `ForegroundServiceStartNotAllowedException` | 模板 `BootReceiver` 已捕获异常并发"请手动打开"高优先级通知 ✅；无人值守要求高时改用 `specialUse` 或加一条 WorkManager/闹钟兜底 |
+| `dataSync` 型前台服务在 Android 15 有 **6 小时/24h 累计上限** | 7×24 无人值守会被系统在额度用尽后停止 | **模板已默认 `specialUse`**（`FOREGROUND_SERVICE_SPECIAL_USE` + `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`，D25）；上架需在 Play 申报用途。改回 `dataSync` 只在 targetSdk 34 且 24h 观测通过时允许 |
+| Android 15 限制从 `BOOT_COMPLETED` 拉起部分 FGS 类型（含 `dataSync`） | 开机自启可能抛 `ForegroundServiceStartNotAllowedException` | 模板 `BootReceiver` 已捕获异常并发"请手动打开"高优先级通知 ✅；无人值守要求高时加一条 WorkManager/闹钟兜底 |
 | `targetSdk` 决定行为变更是否生效 | `targetSdk ≥ 35` 才会吃到上述限制 | Phase 1 就要决策 `targetSdk`，不要拖到验收 |
 
 > 这些是**行为层面**的限制，编译期不会报错——只能靠真机 24h 观测暴露。
@@ -52,10 +52,10 @@
 
 | 症状 | 问题 |
 |---|---|
-| 直接把蓝图第 9 章代码粘进 IDEA 就编译 | 蓝图有多处 Kotlin 语法错误与 API 错误（见 `build-phases.md` 修正清单 D1–D22）。用脚手架，不要手工粘 |
-| 用 `uiautomator dump` 取控件树 | 它会抢占无障碍窗口，导致 RPA 自己的服务挂起或误判。只用 `/api/dump_ui` |
+| 直接把蓝图第 9 章代码粘进 IDEA 就编译 | 蓝图有多处 Kotlin 语法错误与 API 错误（见 `build-phases.md` 修正清单 D1–D28）。用脚手架，不要手工粘 |
+| 用 `uiautomator dump` 取控件树 | 它会抢占无障碍窗口，导致 RPA 自己的服务挂起或误判。只用 `/api/dump_ui`（**唯一例外**：Phase 0 预检，此时还没有自己的无障碍服务） |
 | `busy=true` 时 dump / 截图 / 点击 | 违反铁律；`/api/dump_ui`、`/api/screenshot` 已被模板改成返回 `409` |
-| 中文输入用 `adb shell input text` | 会乱码/失败。只走设备 API 的 `ACTION_SET_TEXT` |
+| 中文输入用 `adb shell input text` | 会乱码/失败。只走设备 API 的 `ACTION_SET_TEXT` 或自建输入法 |
 | 同一动作失败后立刻重试 | "结果未知"的 UI 动作重试 = 可能重复发给真人。先判定是否已完成 |
 | 结果上报超时后重推 | `RESULT_UNKNOWN` 永不重推（第 4.2 节铁律） |
 | 卸载重装解决问题 | 卸载会丢无障碍授权、持久化状态与设备身份。只覆盖安装 |
@@ -66,6 +66,12 @@
 | 把日志/证据包提交进仓库 | 含用户内容与令牌。`.gitignore` 已挡 logs/evidence，交付前再核一次 |
 | 在无人值守前没跑 24h 观测 | 6h FGS 上限、appop 回滚、内存/队列积压都只在长跑里暴露 |
 | 未询问用户就建分支/提交/推送 | 工作区可能混有多条并行工作线。只写用户指定目录，不碰 git |
+| 用 `currentPackage` 之类的事件缓存判断"谁在前台" | 服务重连后缓存不更新 → 轮询器空转、返回键被误拒。用 `isSelfForeground()` / `livePackageName()` |
+| 同一次页面判定里截两次屏 | 系统限频 → OCR 返空 → 误判"不在目标页"。截图一次，尺寸与 OCR 复用 |
+| 把通知正文直接当消息正文 | 目标 App 关闭「显示消息详情」后是占位文本，关键词永不命中。要显式告警 |
+| 用 `Settings.Secure.enabled_input_methods` 读已启用输入法 | targetSdk 34+ 抛 `SecurityException`。改用 `InputMethodManager.getEnabledInputMethodList()` |
+| 锁屏时执行手势并等待 | 手势全部无效，只会表现成"主界面不可达"。先判 `KeyguardManager.isKeyguardLocked` |
+| 为等真人/外部事件反复开监听窗口 | 空耗轮次。一次转交：给清单 + 自检命令，之后最多复核一次 |
 
 ---
 
@@ -79,3 +85,36 @@
 6. 返回键每次只按一次再验证页面，禁止连按。
 7. 任何业务动作不许走 ADB（拔线即断流，ADB 只做安装/权限/取证）。
 8. 只覆盖安装，永不卸载、永不清数据。
+
+---
+
+## P6. 真实案例复盘（2026-10，微信自动回复，约 3700 行 Kotlin）
+
+这一栏全部是**真机跑出来的**，不是推演。每条都已在模板或文档里固化守卫，别重新发明。
+
+| # | 现象 | 根因 | 代价 | 当前守卫 |
+|---|---|---|---|---|
+| 1 | 轮询器每轮都跳过，注入消息后 `pending` 永不归零 | 用 `TYPE_WINDOW_STATE_CHANGED` 缓存的包名判断"RPA 是否在前台"；服务重连后缓存停在旧值 | **生产路径一直是死的**，此前所有成功都是手动触发 | `isSelfForeground()`（实时根节点 + 可见标志），D24 |
+| 2 | 从会话页出发时返回键被拒绝 | 同上缓存把目标 App 误判成自己 | 自动回主页/搜索路径失效 | `safePressBack()` 只信实时信号，D23 |
+| 3 | 夜间 15 小时后被系统停掉 | `dataSync` 前台服务在 Android 15 有 6 小时/日额度 | 7×24 直接失效 | 模板默认 `specialUse`，D25 |
+| 4 | 发送前偶发"会话页判定失败" | 同一次判定里取尺寸与 OCR 各截一次屏，触发系统限频，OCR 返空 | 验收间歇性失败，误判为 OCR 不稳 | 一次截图复用；退避 3 次 |
+| 5 | 关键词永远匹配不上，但系统"看起来正常" | 微信关闭「显示消息详情」，通知正文是占位文本 | 静默失效，最难查 | 占位正文识别 + WARN + 状态位 |
+| 6 | `commitText` 偶发不生效 | 输入法连接瞬时断开 | 少数消息发送失败 | 排队 + 250ms×6 重试 |
+| 7 | 锁屏后所有动作"主界面不可达" | 锁屏时手势全部无效 | 排障方向被误导 | 显式 `keyguardLocked` + 「设备已锁屏」 |
+| 8 | 聊天页停在「按住说话」时发不出 | 语音模式没有输入框 | 偶发失败 | 先点回键盘，失败即取消 |
+| 9 | 读已启用输入法列表崩溃 | targetSdk 34+ `Settings.Secure.enabled_input_methods` 抛 `SecurityException` | 引导页/自检崩 | 改用 `InputMethodManager` |
+| 10 | 引导页点"打开应用详情"崩溃 | 系统设置深链在部分 ROM 不存在，未兜底 | 崩溃 | 三级兜底 + Toast（D28） |
+| 11 | `scaffold.py check` 报"未替换占位符 `<T>`" | 占位符正则把 Kotlin 泛型形参当占位符；还会扫 README 里的示例 | 被迫把泛型改写成非泛型 | 正则只认已知键/多字符大写；只扫代码与配置（D27） |
+| 12 | 改了窗口白名单走 `BuildConfig` 后自检 FAIL | 自检按字面量匹配包名 | 被迫保留字面量，与"配置化"冲突 | 字面量与 `BuildConfig.*_TARGET_PKG` 两种写法都通过 |
+| 13 | 夜间重启原因查不出 | 启动日志没有进程号/版本/上次心跳 | 只能写"原因未知" | 进程启动日志带 pid + 版本（模板已加）；24h 观测必须能归因 |
+| 14 | 为等一条真实来信，反复开监听窗口十余轮 | 没有"外部事件一次转交"的规则 | 轮次空耗 | 收尾清单 + 自检命令，一次交出去 |
+
+### 过程教训（比代码 bug 更值钱）
+
+1. **Phase 0 没做控件树预检，整个感知层返工。** 5 分钟 `uiautomator dump` 就能发现微信隐藏了节点树，
+   而当时是写完脚手架、接上无障碍后才发现。
+2. **验收只覆盖了手动触发路径。** "自动回复全链路通过"一直是 `POST /api/auto_reply` 打出来的，
+   真正的定时轮询是死的。**验收必须打生产触发路径**，手动 API 只算调试通道。
+3. **工具误报要用工具修，不要用代码绕。** 为躲 `scaffold.py` 的占位符误报去改业务写法，是把工具债转成代码债。
+4. **临时放宽的安全配置（白名单 `*`）必须收回并复核**，收尾清单里要有一条。
+5. **24h 没跑满就不能说"可无人值守"**；重启原因未定位，就只能写"未定位"。

@@ -29,8 +29,14 @@ TOOLS_TEMPLATE = TEMPLATE_ROOT / "tools"
 STATE_FILE = ".rpa-scaffold.json"
 DEFAULT_PKG_PATH = Path("app/src/main/java/com/rpalib/app")
 PLACEHOLDER_RE = re.compile(r"<([A-Z][A-Z0-9_]*)>")
+# 只把「脚手架自己认识的键」和「全大写多字符占位」当残留；单字符泛型形参 <T> 不算。
+KNOWN_PLACEHOLDERS = {"APP_ID", "NAMESPACE", "TARGET_PKG", "SECONDARY_TARGET_PKG",
+                      "DEVICE_PORT", "HOST_PORT", "PHONE_IP", "S"}
+SUSPICIOUS_RE = re.compile(r"<([A-Z][A-Z0-9_]{2,})>")
 PKG_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
 TEXT_SUFFIXES = {".kt", ".gradle", ".xml", ".properties", ".pro", ".sh", ".py", ".md", ".txt", ".json"}
+# 占位符残留只扫参与构建/运行的文本；文档里的 <PARAM> 示例不是错误。
+PLACEHOLDER_SCAN_SUFFIXES = {".kt", ".gradle", ".xml", ".properties", ".pro", ".sh", ".py", ".json"}
 
 REQUIRED_FILES = [
     "settings.gradle",
@@ -333,10 +339,14 @@ def check(args: argparse.Namespace) -> int:
             errors.append(f"缺源码: {rel}")
 
     for path in sorted(dest.rglob("*")):
-        if not path.is_file() or path.name == STATE_FILE or not is_text_file(path):
+        if not path.is_file() or path.name == STATE_FILE: continue
+        if path.suffix not in PLACEHOLDER_SCAN_SUFFIXES and path.name not in {"gitignore", ".gitignore"}:
             continue
         text = read_text(path)
         for match in PLACEHOLDER_RE.finditer(text):
+            key = match.group(1)
+            if key not in KNOWN_PLACEHOLDERS and not SUSPICIOUS_RE.fullmatch(match.group(0)):
+                continue
             line = text.count("\n", 0, match.start()) + 1
             errors.append(f"未替换占位符 {match.group(0)} @ {path.relative_to(dest)}:{line}")
 
@@ -357,9 +367,12 @@ def check(args: argparse.Namespace) -> int:
         errors.append("app/build.gradle 的 targetSdk 与状态文件不一致")
     if state.get("target_pkg") and state["target_pkg"] not in manifest:
         errors.append("AndroidManifest.xml 的 <queries> 未包含目标 App 包名")
-    if state.get("target_pkg") and state["target_pkg"] not in svc:
+    # 白名单可以写字面量包名，也可以统一走 BuildConfig.TARGET_PKG（二者都算通过）
+    target_pkg = state.get("target_pkg") or ""
+    if target_pkg and not (target_pkg in svc or "BuildConfig.TARGET_PKG" in svc):
         errors.append("无障碍窗口白名单未包含目标 App 包名")
-    if state.get("secondary_target_pkg") and state["secondary_target_pkg"] not in svc:
+    secondary = state.get("secondary_target_pkg")
+    if secondary and not (secondary in svc or "BuildConfig.SECONDARY_TARGET_PKG" in svc):
         errors.append("无障碍窗口白名单未包含次要目标 App 包名")
     if not state.get("secondary_target_pkg") and "<SECONDARY_TARGET_PKG>" in svc:
         errors.append("未提供次要目标 App，但白名单里仍残留占位行")

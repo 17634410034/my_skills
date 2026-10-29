@@ -34,11 +34,52 @@
 
 ### 问 1：目标页面的控件树可读吗？
 
-- 动作：装好脚手架、开启无障碍后，逐页执行 `tools/capture-context.sh`（Phase 3），检查 `ids.txt` 与 `dump-ui.txt`。
-- 通过标准：关键页面能读到**稳定 `resource-id`**，或至少有稳定 `text`/`contentDescription`。
-- 不通过的典型形态：WebView 内容为空、自绘 Canvas、游戏引擎渲染、`resource-id` 每次随机。
-- 处理：换用文本/描述定位；仍不行则判定「需要逻辑修改或不可行」，写成停止线。
-- 依据：第 5 章停止条件（节点无稳定 ID ⇒ 不许猜）、第 3.7 节（ID 登记表）。
+**先用 5 分钟预检回答，不要等脚手架写完再发现**（脚手架落地前还没有自己的无障碍服务，
+`uiautomator dump` 不与任何 RPA 服务抢窗口；服务一上线就恢复禁令，只走 `/api/dump_ui`）：
+
+```bash
+export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"     # adb 不在默认 PATH
+adb shell am force-stop <TARGET_PKG>
+adb shell monkey -p <TARGET_PKG> -c android.intent.category.LAUNCHER 1
+sleep 3
+adb shell uiautomator dump /sdcard/preflight.xml
+adb shell cat /sdcard/preflight.xml | head -c 3000
+# 判据：XML 里 resource-id 计数、节点总数
+adb shell cat /sdcard/preflight.xml | grep -o 'resource-id="[^"]*"' | sort -u | wc -l
+adb shell cat /sdcard/preflight.xml | grep -o '<node ' | wc -l
+```
+
+- 通过标准：关键页面能读到**稳定 `resource-id`**，或至少有稳定 `text`/`contentDescription`，
+  且节点数与页面文字量相当。
+- **不通过**：人工看页面满是文字，XML 里节点数极少（<10）、`resource-id` 为 0、
+  或根节点 `class` 为空。典型：WebView 内容为空、自绘 Canvas、游戏引擎、以及**主动隐藏无障碍树的商业 App**
+  （真实案例：微信 8.0.52+ 的 `LauncherUI` 根节点 `className=null`、`childCount=0`）。
+- 处理：先换文本/描述定位；仍不行 → 转 0.2.1 的降级通道立项，**不要硬写 ID 适配**。
+- 依据：第 5 章停止条件（节点无稳定 ID ⇒ 不许猜）、第 3.7 节（ID 登记表）、`adaptation.md` 5.10。
+
+### 0.2.1 分岔：控件树被隐藏时的降级通道
+
+控件树不可读不等于不可行，但架构、验收项和风险全变。立项时一次性定清：
+
+| 需求 | 通道 | 说明 |
+|---|---|---|
+| 读（新消息/事件） | 系统通知监听 | 正当语义通道，不绕过目标 App 防护；需 `BIND_NOTIFICATION_LISTENER_SERVICE` + 用户授权 |
+| 看（页面文字与位置） | 无障碍截图 + 离线 OCR | 中文模型可随 APK 内置（真实案例约 +44 MB，断网可用）；连续截图会被系统限频 |
+| 写（中文输入） | 自建输入法 `commitText` | `ACTION_SET_TEXT` 优先，输入法兜底；需处理键盘被切回、连接瞬时断开 |
+| 点 | `dispatchGesture` | 坐标由 OCR 文本位置运行时推导，不写死 |
+
+立项必须同时确认：
+
+- 目标 App 是否会**隐藏通知正文**（微信关闭「显示消息详情」后正文是占位文本）；
+- 设备能否常亮不锁屏（锁屏时手势全部无效）；
+- OCR 误识别容忍度：等长单字差异可容错，**不等长名称一律不容错**（张三 ≠ 张三丰）；
+- 交付体积预算（内置 OCR 模型会让 APK 到 50 MB 量级）。
+
+降级通道立项的额外代价（写进 README 已知限制，别藏着）：
+
+- `TargetIds` 为空 → `ui_ids_guard.py` 失去意义，质量重心转为 **OCR 解析纯函数 + 单测**；
+- 每次动作 8–15 秒（多次截屏 + OCR），轮询间隔要按此设定；
+- 目标 App 升级可能继续强化隐藏策略，属**待验证风险**而非一次性问题。
 
 ### 问 2：动作能用「点击/长按/输入/滚动/返回/截图」表达吗？
 

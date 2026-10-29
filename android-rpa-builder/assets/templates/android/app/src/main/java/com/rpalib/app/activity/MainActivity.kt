@@ -17,6 +17,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationManagerCompat
 import <NAMESPACE>.BuildConfig
 import <NAMESPACE>.service.PrefsConfigStore
@@ -90,16 +91,25 @@ class MainActivity : Activity() {
         root.addView(button("电池优化白名单") { guide.openBatterySettings() })
         root.addView(button("厂商自启动 / 后台弹出界面") { guide.openVendorPermissionPage() })
         root.addView(button("导出当前控件树到剪贴板") { dumpToClipboard() })
-        root.addView(button("打开应用详情") {
-            startActivity(
-                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package=${BuildConfig.APPLICATION_ID}"))
-            )
-        })
+        root.addView(button("打开应用详情") { openAppDetails() })
         return ScrollView(this).apply { addView(root) }
     }
 
     private fun button(label: String, onClick: () -> Unit): Button =
         Button(this).apply { text = label; setOnClickListener { onClick() } }
+
+    /** 系统设置深链在部分 ROM/精简系统上不存在，必须逐级兜底，不能把引导页带崩。 */
+    private fun openAppDetails() {
+        val candidates = listOf(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")),
+            Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        for (intent in candidates) {
+            if (runCatching { startActivity(intent) }.isSuccess) return
+        }
+        Toast.makeText(this, "无法打开系统设置，请手动查找本应用", Toast.LENGTH_LONG).show()
+    }
 
     private fun render() {
         val svc = RpaAccessibilityService.instance
@@ -109,7 +119,7 @@ class MainActivity : Activity() {
             appendLine("无障碍: ${if (svc != null) "已连接" else "未连接"}")
             appendLine("端口: ${RuntimeService.PORT}")
             appendLine("模式: ${if (cfg.enabled) "AI 自动" else "人工接管"}")
-            appendLine("当前页面: ${svc?.currentPackage.orEmpty()} / ${svc?.currentClassName.orEmpty()}")
+            appendLine("当前页面: ${svc?.livePackageName() ?: svc?.lastEventPackage ?: "-"} / ${svc?.liveClassName() ?: svc?.lastEventClassName ?: "-"}")
             append("设备令牌: ${if (cfg.deviceToken.isNotBlank()) "已配置" else "未配置（仅回环可访问）"}")
         }
         permissionView.text = buildString {

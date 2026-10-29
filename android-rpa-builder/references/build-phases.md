@@ -98,6 +98,12 @@ python3 <skill>/scripts/scaffold.py check --dest <dest>
 | D20 | 文档占位符 | `"/api/<your_action>"`、`<PHONE_IP>`、`<S>` 等小写/文档占位符，正则替换容易漏 | 模板已具体化，`scaffold.py check` 会兜底扫描 |
 | D21 | `AndroidManifest.xml` | 声明 `RECEIVE_BOOT_COMPLETED` 但开机自启在 Android 15+ 可能被拒，且无兜底 | `BootReceiver` 捕获异常并发高优先级通知（详见 `pitfalls.md`） |
 | D22 | `RuntimeService.kt` | 未配置令牌时没有任何提示，运维不知道当前处于"仅回环"模式 | 启动时 `WARN` 日志 + 引导页状态显示 |
+| D23 | `RpaAccessibilityService.kt` | 用 `TYPE_WINDOW_STATE_CHANGED` 缓存包名判断前台，服务重连后不更新 | 改实时 `livePackageName()` / `isSelfForeground()`；缓存改名 `lastEventPackage` 仅供日志（P6-1/2） |
+| D24 | `PollerBase.kt` | 同上：轮询器用缓存包名判断"RPA 在自己前台"，导致整条轮询路径空转 | 改 `svc.isSelfForeground()`（P6-1） |
+| D25 | `AndroidManifest.xml` | `dataSync` 型前台服务在 Android 15 有 6 小时/日上限，7×24 会被停 | 默认 `specialUse` + `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`；API 34+ 显式传 `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`（P6-3） |
+| D26 | `RuntimeService.kt` / `MainActivity.kt` / `TargetOperator.kt` | 状态端点与主页判定也读了缓存包名，运维看到的是过期值 | 全部改实时值，缓存只作兜底显示（P6-1） |
+| D27 | `scaffold.py` | 占位符正则把 Kotlin 泛型 `<T>` 当占位符；还会扫 README 里的 `<PARAM>` 示例 | 只认已知键或多字符全大写；只扫代码与配置文本（P6-11） |
+| D28 | `MainActivity.kt` | "打开应用详情"直接 `startActivity` 系统深链，部分 ROM 不存在该 Activity → 崩溃 | 三级兜底（应用详情 → 应用设置 → 设置根）+ Toast（P6-10） |
 
 > 另有一处**非阻塞文档不一致**：`DeviceHttpServer` 的 CORS 白名单常量 `ALLOWED_ORIGINS` 未被使用（默认不发 CORS 头，浏览器跨源被拒）。若确实需要 Web 面板直连，按白名单补 `Access-Control-Allow-Origin`，**禁止 `*`**。
 

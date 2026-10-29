@@ -63,7 +63,7 @@ class TargetOperator(
      */
     fun isHome(): Boolean {
         val svc = RpaAccessibilityService.instance ?: return false
-        return svc.hasTargetAccessibilityRoot() && svc.currentClassName.isNotBlank()
+        return svc.isTargetForeground() && !svc.liveClassName().isNullOrBlank()
     }
 
     /** 失败取证载荷：可见控件摘要写进日志。没有取证载荷的失败等于无法复现的失败。 */

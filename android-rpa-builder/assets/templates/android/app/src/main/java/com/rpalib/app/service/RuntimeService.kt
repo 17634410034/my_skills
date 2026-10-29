@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -60,7 +61,8 @@ class RuntimeService : Service() {
 
         /**
          * 开机自启失败时的兜底：发高优先级通知让人手动打开。
-         * Android 15+ 禁止从 BOOT_COMPLETED 拉起 dataSync 型前台服务（见 references/pitfalls.md）。
+         * Android 15+ 对部分前台服务类型（含 dataSync）限制从 BOOT_COMPLETED 拉起；
+         * 模板默认用 specialUse 规避 6 小时/日上限，但开机拉起仍可能被拒（见 references/pitfalls.md P3）。
          */
         fun notifyManualStartRequired(context: Context, reason: String) {
             try {
@@ -105,6 +107,8 @@ class RuntimeService : Service() {
         instance = this
         // 装配顺序固定（第 2.2 节）
         EventLogger.init(applicationContext)
+        // 重启归因的最小证据：进程号 + 版本号，配合心跳日志才能判断"是不是被系统杀了"
+        EventLogger.info(TAG, "进程启动", "pid=${android.os.Process.myPid()} version=${BuildConfig.VERSION_NAME}")
         configStore = PrefsConfigStore(applicationContext)
         if (configStore.getConfig().deviceToken.isBlank()) {
             EventLogger.warn(TAG, "设备令牌未配置：HTTP 将只允许 127.0.0.1 访问（仅本地调试）")
@@ -114,7 +118,11 @@ class RuntimeService : Service() {
         taskController = TaskController(lock, FileTaskResultStore(applicationContext), handlerRegistry(targetOperator, lock, configStore))
         pollers = buildPollers(lock, configStore, targetOperator, taskController)   // 你的业务轮询器
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
         screenAwake = ScreenAwakeController(applicationContext)
         screenAwake.start()
         startRuntimeIfNeeded()
@@ -174,8 +182,8 @@ class RuntimeService : Service() {
         return mapOf(
             "accessibilityEnabled" to (svc != null),
             "httpServerRunning" to isRunning,
-            "currentApp" to (svc?.currentPackage ?: ""),
-            "currentPage" to (svc?.currentClassName ?: ""),
+            "currentApp" to (svc?.livePackageName() ?: svc?.lastEventPackage ?: ""),
+            "currentPage" to (svc?.liveClassName() ?: svc?.lastEventClassName ?: ""),
             "taskQueueSize" to (if (::taskController.isInitialized) taskController.queueSize() else 0),
             "mode" to if (configStore.getConfig().enabled) "ai" else "manual",
             "versionName" to BuildConfig.VERSION_NAME,

@@ -4,7 +4,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 7×24 无人值守：dataSync 在 Android 15+ 有 6 小时/日累计上限，故用 specialUse（见 references/pitfalls.md P3） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -54,7 +55,12 @@
         <service
             android:name="<NAMESPACE>.service.RuntimeService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <!-- Android 14+ 要求 specialUse 声明具体用途；上架时需在 Play 后台同步申报 -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="unattended accessibility-based device automation" />
+        </service>
 
         <!-- 若采纳第 7.3 项的 watchdog 建议，补这个 Receiver -->
         <receiver
