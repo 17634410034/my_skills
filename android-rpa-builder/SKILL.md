@@ -69,6 +69,8 @@ description: Android 无障碍 RPA 项目构建器：基于 AccessibilityService
 
 **中途踩坑先查** `references/pitfalls.md`（反模式自查表 + 厂商 ROM 预算 + Android 15 前台服务限制 + 真实案例复盘 P6）。
 
+**真机装包、看控件树、查日志、定位"为什么不触发"** → 用配套 skill `android-rpa-device-ops`（builder 造 / 它来验）。
+
 ---
 
 ## 收尾（Phase 7 之后）

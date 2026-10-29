@@ -6,6 +6,7 @@
 |---|---|---|
 | [hdr-gate](#hdr-gate--异构双审门禁heterogeneous-dual-signoff-gate) | 复杂需求先产出一份**陌生 agent 能独立执行**的开发文档 | 跨 3 个以上文件、涉及架构/数据模型、要引入新依赖，或用户明确要方案 |
 | [android-rpa-builder](#android-rpa-builder--android-无障碍-rpa-项目构建器) | 把「自动操作某 App」落成可编译、可远程驱动的 Android 工程 | 无障碍 RPA、手机群控、定时任务、换目标 App 适配 |
+| [android-rpa-device-ops](#android-rpa-device-ops--android-rpa-真机调试与运维) | builder 的配套 skill：装到真机、取证、按症状排障 | 工程跑不起来、不触发、控件树为空、结果 LOST、适配回归 |
 | [mcp-tool-selection](#mcp-tool-selection--mcp-工具注册表设计与工具检索) | 工具多到选不准时，先补工具卡而不是先上架构 | 工具超过 50 个、schema token 膨胀、要评估工具检索 |
 
 ---
@@ -198,6 +199,65 @@ python3 <skill>/scripts/scaffold.py check --dest .
 ### 与 hdr-gate 的分工
 
 `hdr-gate` 产出一份**给别人执行的开发文档**（不动代码）；`android-rpa-builder` **直接把工程和代码做出来**。需要先审视方案再动手时，可以先用 `hdr-gate` 出文档，再用本 skill 执行。
+
+工程生成之后，真机调试与排障交给配套的 **`android-rpa-device-ops`**。
+
+---
+
+## android-rpa-device-ops — Android RPA 真机调试与运维
+
+`android-rpa-builder` 的配套 skill：**builder 负责造，它负责验**——把工程装到真机、看清页面、驱动动作、按症状定位，并把每次「修好了」变成可复核的证据。
+
+核心命题：
+
+> 真机调试不是随手点两下看看，而是**每次只改一个变量，用同一套三源证据（前台 Activity + 控件树 + 截图）证明前后差异**。没有证据的「好了」等于没修。
+
+### 关键能力
+
+1. **零硬编码接入**：包名、端口、目标 App 全部从脚手架状态文件 `.rpa-scaffold.json` 读，换工程、换设备、换人都不改脚本；多设备显式 `-s`。
+2. **一条命令体检**：`rpa.sh doctor` 依次检查设备在线、端口转发、HTTP 服务、无障碍连接、忙闲、锁屏、厂商后台权限，逐项给出 PASS/FAIL（另附 WARN/INFO 提示）。
+3. **三源取证**：`dump` / `shot` 自动落到仓库外的证据目录（`/tmp/rpa-debug/<时间>/`，`chmod 700`），`dump` 按页面标签分目录；`logs` 直接输出，需要留存时自行重定向。
+4. **症状驱动排障**：轮询器空转、409 不释放、结果 `LOST`、控件树为空、截图限频、无障碍掉线、输入法抢焦点、通知不进箱、长跑被系统停掉，逐条给出「先查什么 → 判据 → 处置 → 停止线」。
+5. **覆盖安装闭环**：单测与构建分开跑 → `install -r` → 启动 → `pidof` → appops → 端口转发 → 状态复检；签名冲突不靠卸载绕过。
+6. **适配回归边界**：ID 适配方法论仍归 builder，本 skill 只做装上去后的针对性回归（只回归本轮改动的 ID + 一条只读恢复链），不重跑整套 A1→D2。
+7. **生产路径优先**：业务动作走 RPA 任务 API，`adb input` 只限人工调试导航；手动 API 验证不算验收，必须打定时/轮询/后端触发路径。
+8. **证据纪律**：只写跑过的；外部事件项一次转交不空等；重启原因查不出就写「未定位」。
+
+### 目录
+
+```
+android-rpa-device-ops/
+├── SKILL.md                     # 主指令：硬规则 / 五步闭环 / 症状矩阵 / 报告模板
+├── references/
+│   ├── adb-and-api.md           # ADB 命令、RPA HTTP API 字段、日志、构建安装
+│   └── troubleshooting.md       # 八类故障的诊断树
+└── tools/
+    └── rpa.sh                   # 调试助手：doctor/status/queue/task/dump/shot/logs/install/start/stop/restart
+```
+
+### 快速开始
+
+```bash
+# 在 builder 生成的工程根目录（含 .rpa-scaffold.json）
+export RPA_DEVICE_TOKEN="设备令牌"          # 或用 --token 传入
+
+bash android-rpa-device-ops/tools/rpa.sh doctor   # 设备 / 服务 / 无障碍 / 忙闲 / 锁屏体检
+bash android-rpa-device-ops/tools/rpa.sh status   # /api/status 全量
+bash android-rpa-device-ops/tools/rpa.sh dump 会话页
+bash android-rpa-device-ops/tools/rpa.sh logs 80
+bash android-rpa-device-ops/tools/rpa.sh install  # 构建 + 覆盖安装 + 启动 + 复检
+```
+
+脚本会自己读 `.rpa-scaffold.json`、建端口转发并按需带令牌；多设备用 `-s <serial>` 或环境变量 `ANDROID_SERIAL` 指定。
+
+### 与 builder 的分工
+
+| 场景 | 用哪个 |
+|---|---|
+| 从零做新 RPA / 换目标 App / 写适配方法论 | `android-rpa-builder` |
+| 装到真机、看控件树、查日志、定位「为什么不触发」 | `android-rpa-device-ops` |
+| 目标 App 升级后重校准 ID | builder 的 `adaptation.md` + guard；本 skill 负责安装与回归 |
+| 24h 观测与无人值守验收 | builder 的 `acceptance.md`；本 skill 提供体检与日志 |
 
 ---
 
